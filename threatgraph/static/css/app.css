@@ -133,9 +133,10 @@
     display: flex; align-items: center; justify-content: center;
     font-size: 9px; flex-shrink: 0; margin-right: 6px;
   }
-  .icon-root { background: rgba(231,76,60,0.2); color: #e74c3c; }
-  .icon-child { background: rgba(52,152,219,0.2); color: #58a6ff; }
-
+  .icon-root { background-color: rgba(231, 76, 60, 0.15); color: #e74c3c; border: 1px solid rgba(231, 76, 60, 0.4); }
+  .icon-child { background-color: rgba(52, 152, 219, 0.15); color: #3498db; border: 1px solid rgba(52, 152, 219, 0.4); }
+  .icon-file { background-color: rgba(46, 160, 67, 0.15); color: #2ea043; border: 1px solid rgba(46, 160, 67, 0.4); }
+  .icon-registry { background-color: rgba(163, 113, 247, 0.15); color: #a371f7; border: 1px solid rgba(163, 113, 247, 0.4); }
   .node-name {
     font-size: 12px; color: #c9d1d9; font-weight: 500;
     white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex: 1;

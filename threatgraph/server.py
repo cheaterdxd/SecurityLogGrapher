@@ -9,7 +9,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from threatgraph.parser.evtx_parser import parse_evtx
-from threatgraph.normalize.event_4688 import normalize_event
+from threatgraph.normalize.events import normalize_event
 import json
 import asyncio
 

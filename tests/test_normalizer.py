@@ -3,7 +3,7 @@ Tests for the Event 4688 Normalizer module.
 """
 import pytest
 
-from threatgraph.normalize.event_4688 import normalize_event, _parse_pid
+from threatgraph.normalize.events import normalize_event, _parse_pid
 
 
 # --- Sample XML data ---

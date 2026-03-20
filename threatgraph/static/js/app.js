@@ -248,8 +248,19 @@ function buildNodeEl(nodeId, depth, filterText) {
   row.appendChild(eb);
 
   const ic = document.createElement("span");
-  ic.className = "node-icon " + (node.is_root ? "icon-root" : "icon-child");
-  ic.textContent = node.is_root ? "R" : "C";
+  let iconClass = node.is_root ? "icon-root" : "icon-child";
+  let iconText = node.is_root ? "R" : "C";
+  
+  if (node.node_type === "file") {
+    iconClass = "icon-file"; 
+    iconText = "F"; 
+  } else if (node.node_type === "registry" || node.node_type === "key") {
+    iconClass = "icon-registry";
+    iconText = "K";
+  }
+  
+  ic.className = "node-icon " + iconClass;
+  ic.textContent = iconText;
   row.appendChild(ic);
 
   const nm = document.createElement("span");
@@ -499,14 +510,34 @@ function renderChainGraph(selectedId) {
     .style("cursor", "pointer");
 
   nodeGs.append("circle")
-    .attr("r", d => d.id === selectedId ? 12 : (d.is_root ? 10 : 8))
-    .attr("fill", d => d.id === selectedId ? "#f0c674" : (d.is_root ? "#e74c3c" : "#3498db"))
+    .attr("r", d => d.id === selectedId ? 16 : (d.is_root ? 14 : 12))
+    .attr("fill", d => {
+      if (d.id === selectedId) return "#f0c674";
+      if (!d.node_type || d.node_type === 'process') return d.is_root ? "#e74c3c" : "#3498db";
+      if (d.node_type === 'file') return "#2ea043"; // Git Green
+      if (d.node_type === 'registry' || d.node_type === 'key') return "#a371f7"; // Git Purple
+      return "#8b949e";
+    })
     .attr("stroke", d => d.id === selectedId ? "#fff" : "rgba(255,255,255,0.3)")
     .attr("stroke-width", d => d.id === selectedId ? 2.5 : 1);
 
   nodeGs.append("text")
-    .text(d => d.short_name)
-    .attr("dy", d => chainLinks.some(l => l.target === d.id) ? 22 : -16)
+    .text(d => {
+      if (d.node_type === 'file') return 'F';
+      if (d.node_type === 'registry' || d.node_type === 'key') return 'RK';
+      return 'P';
+    })
+    .attr("dy", "4")
+    .attr("text-anchor", "middle")
+    .attr("fill", d => d.id === selectedId ? "#24292e" : "#fff")
+    .attr("font-size", d => d.id === selectedId ? "11px" : "9px")
+    .attr("font-weight", "bold")
+    .attr("font-family", "Inter, sans-serif")
+    .style("pointer-events", "none");
+
+  nodeGs.append("text")
+    .text(d => d.short_name.length > 15 ? d.short_name.substring(0, 12) + "..." : d.short_name)
+    .attr("dy", d => chainLinks.some(l => l.target === d.id) ? 28 : -22)
     .attr("text-anchor", "middle")
     .attr("fill", d => d.id === selectedId ? "#f0c674" : "#c9d1d9")
     .attr("font-size", "10px").attr("font-family", "Inter, sans-serif")
@@ -521,7 +552,19 @@ function renderChainGraph(selectedId) {
   nodeGs.on("mouseover", (e, d) => {
     const [mx, my] = d3.pointer(e, graphArea);
     const ts = d.timestamp ? new Date(d.timestamp).toLocaleString() : "";
-    tooltip.innerHTML = `<div class="tt-name">${esc(d.short_name)}</div><div class="tt-sub">PID: ${d.pid}${ts ? ' · ' + ts : ''}</div>`;
+    let html = `<div class="tt-name">${esc(d.short_name)}</div>`;
+    if (d.node_type === 'file' || d.node_type === 'registry' || d.node_type === 'key') {
+      const pnode = parentMap[d.id] ? nodes[parentMap[d.id]] : null;
+      html += `<div class="tt-sub">ProcessId: ${pnode ? pnode.pid : 'Unknown'}</div>`;
+      html += `<div class="tt-sub">ProcessName: ${pnode ? esc(pnode.short_name) : 'Unknown'}</div>`;
+      html += `<div class="tt-sub">ObjectName: ${esc(d.object_name || d.short_name)}</div>`;
+      if (d.node_type === 'file') html += `<div class="tt-sub">AccessList: ${esc(d.access_list || 'None')}</div>`;
+      else html += `<div class="tt-sub">NewValue: ${esc(d.new_value || 'None')}</div>`;
+      if (ts) html += `<div class="tt-sub" style="margin-top:2px;">Time: ${ts}</div>`;
+    } else {
+      html += `<div class="tt-sub">PID: ${d.pid}${ts ? ' · ' + ts : ''}</div>`;
+    }
+    tooltip.innerHTML = html;
     tooltip.style.left = (mx + 14) + "px"; tooltip.style.top = (my - 8) + "px"; tooltip.style.opacity = 1;
   });
   nodeGs.on("mouseout", () => tooltip.style.opacity = 0);
@@ -561,11 +604,24 @@ function showInlineInfoBoxes(chainNodes) {
     const childPids = cnodes.map(c => c.pid).join(", ");
     
     let h = `<div class="title" style="margin-bottom: 6px; padding-bottom: 4px; border-bottom: 1px solid #30363d; font-weight: 600; color: ${isSelected ? '#f0c674' : '#58a6ff'}; user-select: none;">${esc(snode.short_name)} ${isSelected ? '<span style="font-size:9px;">(SELECTED)</span>' : ''}</div>`;
-    h += `<div class="row" style="display:flex; justify-content:space-between; margin-bottom: 3px;"><div class="lbl" style="color:#8b949e; width: 40%;">Node PID</div><div class="val" style="color:#c9d1d9; width: 60%; word-break: break-all;">${esc(tpid)}</div></div>`;
-    h += `<div class="row" style="display:flex; justify-content:space-between; margin-bottom: 3px;"><div class="lbl" style="color:#8b949e; width: 40%;">Parent PID</div><div class="val" style="color:#c9d1d9; width: 60%; word-break: break-all;">${spid ? esc(spid) : '&nbsp;'}</div></div>`;
-    h += `<div class="row" style="display:flex; justify-content:space-between; margin-bottom: 3px;"><div class="lbl" style="color:#8b949e; width: 40%;">Children PIDs</div><div class="val" style="color:#c9d1d9; width: 60%; word-break: break-all;">${childPids ? esc(childPids) : '&nbsp;'}</div></div>`;
-    h += `<div style="color:#8b949e; margin-top: 6px; margin-bottom: 2px;">Source CmdLine</div><div style="color:#c9d1d9; background:#0d1117; padding:4px; border-radius:4px; word-break:break-all;">${scmd ? esc(scmd) : '&nbsp;'}</div>`;
-    h += `<div style="color:#8b949e; margin-top: 6px; margin-bottom: 2px;">Target CmdLine</div><div style="color:#c9d1d9; background:#0d1117; padding:4px; border-radius:4px; word-break:break-all;">${tcmd ? esc(tcmd) : '&nbsp;'}</div>`;
+    
+    if (snode.node_type === 'file' || snode.node_type === 'registry' || snode.node_type === 'key') {
+      const parentName = pnode ? pnode.short_name : 'Unknown';
+      h += `<div class="row" style="display:flex; justify-content:space-between; margin-bottom: 3px;"><div class="lbl" style="color:#8b949e; width: 40%;">ProcessId</div><div class="val" style="color:#c9d1d9; width: 60%; word-break: break-all;">${spid ? esc(spid) : '&nbsp;'}</div></div>`;
+      h += `<div class="row" style="display:flex; justify-content:space-between; margin-bottom: 3px;"><div class="lbl" style="color:#8b949e; width: 40%;">ProcessName</div><div class="val" style="color:#c9d1d9; width: 60%; word-break: break-all;">${esc(parentName)}</div></div>`;
+      h += `<div style="color:#8b949e; margin-top: 6px; margin-bottom: 2px;">ObjectName</div><div style="color:#c9d1d9; background:#0d1117; padding:4px; border-radius:4px; word-break:break-all;">${esc(snode.object_name || snode.short_name)}</div>`;
+      if (snode.node_type === 'file') {
+        h += `<div style="color:#8b949e; margin-top: 6px; margin-bottom: 2px;">AccessList</div><div style="color:#c9d1d9; background:#0d1117; padding:4px; border-radius:4px; word-break:break-all;">${esc(snode.access_list || 'None')}</div>`;
+      } else {
+        h += `<div style="color:#8b949e; margin-top: 6px; margin-bottom: 2px;">NewValue</div><div style="color:#c9d1d9; background:#0d1117; padding:4px; border-radius:4px; word-break:break-all;">${esc(snode.new_value || 'None')}</div>`;
+      }
+    } else {
+      h += `<div class="row" style="display:flex; justify-content:space-between; margin-bottom: 3px;"><div class="lbl" style="color:#8b949e; width: 40%;">Node PID</div><div class="val" style="color:#c9d1d9; width: 60%; word-break: break-all;">${esc(tpid)}</div></div>`;
+      h += `<div class="row" style="display:flex; justify-content:space-between; margin-bottom: 3px;"><div class="lbl" style="color:#8b949e; width: 40%;">Parent PID</div><div class="val" style="color:#c9d1d9; width: 60%; word-break: break-all;">${spid ? esc(spid) : '&nbsp;'}</div></div>`;
+      h += `<div class="row" style="display:flex; justify-content:space-between; margin-bottom: 3px;"><div class="lbl" style="color:#8b949e; width: 40%;">Children PIDs</div><div class="val" style="color:#c9d1d9; width: 60%; word-break: break-all;">${childPids ? esc(childPids) : '&nbsp;'}</div></div>`;
+      h += `<div style="color:#8b949e; margin-top: 6px; margin-bottom: 2px;">Source CmdLine</div><div style="color:#c9d1d9; background:#0d1117; padding:4px; border-radius:4px; word-break:break-all;">${scmd ? esc(scmd) : '&nbsp;'}</div>`;
+      h += `<div style="color:#8b949e; margin-top: 6px; margin-bottom: 2px;">Target CmdLine</div><div style="color:#c9d1d9; background:#0d1117; padding:4px; border-radius:4px; word-break:break-all;">${tcmd ? esc(tcmd) : '&nbsp;'}</div>`;
+    }
     
     const box = document.createElement("div");
     box.className = "inline-info-box multi-info-box";
