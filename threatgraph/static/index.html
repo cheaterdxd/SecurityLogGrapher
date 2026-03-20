@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ThreatGraph — Process Tree Explorer</title>
+<script src="https://d3js.org/d3.v7.min.js"></script>
+<link rel="stylesheet" href="/static/css/app.css">
+</head>
+<body>
+
+<!-- UPLOAD SCREEN -->
+<div id="upload-screen">
+  <div class="upload-card">
+    <div class="uc-icon">📊</div>
+    <h1>ThreatGraph Explorer</h1>
+    <p class="uc-sub">Upload a Windows Security Event Log (.evtx) file to visualize process chains and execution trees.</p>
+    
+    <label for="file-input" class="upload-zone" id="upload-zone">
+      <div class="uz-icon">📁</div>
+      <div class="uz-title">Choose .evtx file or drag here</div>
+      <div class="uz-hint">Max file size: 100MB+ depending on network</div>
+    </label>
+    <input type="file" id="file-input" accept=".evtx" style="display: none;">
+    
+    <div id="upload-progress" style="display: none;">
+      <div class="loader-spinner"></div>
+      <div class="up-text" id="stream-status">Uploading EVTX...</div>
+      <div class="stream-stats" style="display:none;" id="stream-stats">
+        Extracted Events: <span id="stat-extracted">0</span><br>
+        Process Chains: <span id="stat-tree-count">0</span>
+      </div>
+    </div>
+    
+    <div id="upload-error" class="error-msg" style="display: none;"></div>
+  </div>
+</div>
+
+<!-- MAIN WORKSPACE -->
+<div id="workspace" style="display: none;">
+  <!-- LEFT PANEL: Tree Explorer -->
+  <div id="tree-panel">
+    <div id="tree-header">
+      <h1>🔍 ThreatGraph Explorer</h1>
+      <div class="stats-bar">
+        <div>Total: <span id="stat-total">0</span></div>
+        <div>Roots: <span id="stat-roots">0</span></div>
+        <div>Visible: <span id="stat-visible">0</span></div>
+      </div>
+    </div>
+    <div id="search-box">
+      <div class="search-wrapper">
+        <span class="search-icon">🔎</span>
+        <input id="search-input" type="text" placeholder="Search process, PID, command...">
+      </div>
+    </div>
+    <div class="action-bar">
+      <button class="action-btn" id="btn-expand-all">▸ Expand All</button>
+      <button class="action-btn" id="btn-collapse-all">◂ Collapse All</button>
+      <button class="action-btn" id="btn-new-file" style="margin-left:auto; color:#fff; border-color:#58a6ff;">📤 Upload New File</button>
+    </div>
+    <div id="tree-container"></div>
+    <div id="visible-bar">
+      <div>Showing <span id="vis-count">0</span> / <span id="vis-total">0</span></div>
+      <div>Click ▸ to expand</div>
+    </div>
+  </div>
+
+  <!-- RIGHT PANEL: Graph + Detail -->
+  <div id="right-panel">
+    <!-- Chain Graph -->
+    <div id="graph-area">
+      <div class="graph-empty" id="graph-empty">
+        <div class="graph-empty-icon">⚲</div>
+        <p>Select a node from the Tree Explorer<br>to visualize its execution chain.</p>
+      </div>
+      
+      <div class="graph-controls" id="graph-controls" style="display:none;">
+        <button id="gc-zin" title="Zoom In">+</button>
+        <button id="gc-zout" title="Zoom Out">-</button>
+        <button id="gc-fit" title="Fit to Screen">⛶</button>
+      </div>
+      
+      <div class="chain-label" id="graph-label" style="display:none;">
+        <span class="chain-badge">CHAIN</span>
+        <span id="chain-name">Hover to inspect</span>
+        <span class="chain-node-count" title="Total nodes in view"><span id="chain-count">0</span> nodes</span>
+      </div>
+      <div id="graph-tooltip" class="graph-tooltip"></div>
+      <div id="inline-info-box" class="inline-info-box" style="display:none;"></div>
+      <svg id="graph-svg" width="100%" height="100%"></svg>
+    </div>
+
+    <!-- Resize -->
+    <div id="resize-handle"></div>
+
+    <!-- Node Detail -->
+    <div id="detail-area">
+      <div class="detail-empty-sm">Click a node in the graph to see details</div>
+    </div>
+  </div>
+</div>
+
+<script src="/static/js/app.js"></script>
+</body>
+</html>

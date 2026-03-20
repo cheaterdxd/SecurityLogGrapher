@@ -1,0 +1,7 @@
+python-evtx
+networkx
+pyvis
+typer
+lxml
+matplotlib
+pytest

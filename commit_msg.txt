@@ -1,0 +1,8 @@
+feat(ui): implement progressive SSE streaming and interactive smart-fanning graph overlays
+
+- Refactor backend EVTX processing to stream parsed events incrementally via Server-Sent Events (SSE) `/api/stream/{task_id}` for massive performance gains.
+- Shift graph construction logic (nodes, parent/child mapping) from Python backend to client-side JavaScript for real-time rendering.
+- Implement dynamic scope rendering (n-2 to n+2) to limit chain view size and maintain 60FPS graph interactions.
+- Add draggable, multi-node floating information overlays with a smart fanning pattern (alternating left/right cascading offsets) specifically attached to D3 zoom/pan transforms.
+- Add scrollbars & pointer-events isolation mapped to `wheel` event to allow scrolling inside long CmdLine strings without triggering SVG chart zooms.
+- Fix UI bug causing double file dialog prompts by fully migrating the upload dropzone to native HTML `<label for="file-input">` click behavior.
