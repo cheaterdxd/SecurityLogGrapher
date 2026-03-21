@@ -1,7 +1,23 @@
-python-evtx
+# Core parsing & graph
+evtx
+lxml
 networkx
 pyvis
+
+# Web server
+fastapi
+uvicorn[standard]
+python-multipart
+
+# CLI
 typer
-lxml
+
+# Visualization
 matplotlib
+
+# Testing
 pytest
+pytest-asyncio
+pytest-cov
+coverage
+httpx

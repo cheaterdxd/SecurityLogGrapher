@@ -1,0 +1,26 @@
+name: threatgraph
+channels:
+  - defaults
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+      # Core parsing & graph
+      - evtx
+      - lxml
+      - networkx
+      - pyvis
+      # Web server
+      - fastapi
+      - uvicorn[standard]
+      - python-multipart
+      # CLI
+      - typer
+      # Visualization
+      - matplotlib
+      # Testing
+      - pytest
+      - pytest-asyncio
+      - pytest-cov
+      - coverage
+      - httpx

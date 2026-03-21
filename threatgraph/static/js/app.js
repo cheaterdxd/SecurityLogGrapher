@@ -133,11 +133,14 @@ function processEvent(ev) {
   Object.assign(nodes[childId], {
     id: childId,
     pid: ev.pid,
+    event_id: ev.event_id || "",
     label: ev.process_name,
     short_name: shortName(ev.process_name),
     command_line: ev.command_line || "",
     timestamp: ev.timestamp,
     raw_xml: ev.raw_xml,
+    node_type: ev.node_type,
+    object_name: ev.object_name,
     is_root: false
   });
   roots.delete(childId); // definitely not a root
@@ -197,6 +200,7 @@ const treeContainer = document.getElementById("tree-container");
 function renderTree(filterText) {
   treeContainer.innerHTML = "";
   visibleCount = 0;
+  _buildVisited.clear();
   const frag = document.createDocumentFragment();
   
   // Convert roots Set to array and sort chronologically based on oldest child
@@ -215,7 +219,10 @@ function renderTree(filterText) {
   document.getElementById("vis-count").textContent = visibleCount;
 }
 
+const _buildVisited = new Set();
 function buildNodeEl(nodeId, depth, filterText) {
+  if (_buildVisited.has(nodeId)) return null;
+  _buildVisited.add(nodeId);
   const node = nodes[nodeId];
   if (!node) return null;
   const children = childrenMap[nodeId] || [];
@@ -256,7 +263,7 @@ function buildNodeEl(nodeId, depth, filterText) {
     iconText = "F"; 
   } else if (node.node_type === "registry" || node.node_type === "key") {
     iconClass = "icon-registry";
-    iconText = "K";
+    iconText = "RG";
   }
   
   ic.className = "node-icon " + iconClass;
@@ -312,13 +319,17 @@ function matchNode(n, t) {
   return n.short_name.toLowerCase().includes(q)
     || n.label.toLowerCase().includes(q)
     || String(n.pid).includes(q)
+    || (n.event_id && String(n.event_id).includes(q))
     || (n.command_line && n.command_line.toLowerCase().includes(q));
 }
-function subtreeMatches(nid, t) {
+function subtreeMatches(nid, t, visited) {
+  if (!visited) visited = new Set();
+  if (visited.has(nid)) return false;
+  visited.add(nid);
   const n = nodes[nid];
   if (!n) return false;
   if (matchNode(n, t)) return true;
-  return (childrenMap[nid] || []).some(c => subtreeMatches(c, t));
+  return (childrenMap[nid] || []).some(c => subtreeMatches(c, t, visited));
 }
 function highlightText(text, q) {
   const i = text.toLowerCase().indexOf(q.toLowerCase());
@@ -331,9 +342,12 @@ function toggleExpand(nid) {
   if (expanded.has(nid)) collapseNode(nid); else expanded.add(nid);
   renderTree(currentFilter);
 }
-function collapseNode(nid) {
+function collapseNode(nid, visited) {
+  if (!visited) visited = new Set();
+  if (visited.has(nid)) return;
+  visited.add(nid);
   expanded.delete(nid);
-  (childrenMap[nid] || []).forEach(c => collapseNode(c));
+  (childrenMap[nid] || []).forEach(c => collapseNode(c, visited));
 }
 
 function selectTreeNode(nodeId) {
@@ -348,7 +362,7 @@ function selectTreeNode(nodeId) {
 
 document.getElementById("search-input").addEventListener("input", function() {
   clearTimeout(this._t);
-  this._t = setTimeout(() => { currentFilter = this.value.trim(); renderTree(currentFilter); }, 200);
+  this._t = setTimeout(() => { currentFilter = this.value.trim(); renderTree(currentFilter); }, 500);
 });
 document.getElementById("btn-expand-all").onclick = () => { roots.forEach(r => expanded.add(r)); renderTree(currentFilter); };
 document.getElementById("btn-collapse-all").onclick = () => { expanded.clear(); renderTree(currentFilter); };
@@ -524,7 +538,7 @@ function renderChainGraph(selectedId) {
   nodeGs.append("text")
     .text(d => {
       if (d.node_type === 'file') return 'F';
-      if (d.node_type === 'registry' || d.node_type === 'key') return 'RK';
+      if (d.node_type === 'registry' || d.node_type === 'key') return 'RG';
       return 'P';
     })
     .attr("dy", "4")
@@ -758,4 +772,23 @@ document.addEventListener("mousemove", e => {
   const newDetailH = rect.bottom - e.clientY;
   detailArea.style.height = Math.max(80, Math.min(newDetailH, rect.height - 150)) + "px";
 });
-document.addEventListener("mouseup", () => { resizing = false; });
+document.addEventListener("mouseup", () => { resizing = false; leftResizing = false; document.body.style.cursor = ''; });
+
+// ════════════════════════════════════════════════
+// LEFT PANEL RESIZE
+// ════════════════════════════════════════════════
+const leftResizeHandle = document.getElementById("left-resize-handle");
+const treePanel = document.getElementById("tree-panel");
+let leftResizing = false;
+
+leftResizeHandle.addEventListener("mousedown", e => {
+  leftResizing = true;
+  document.body.style.cursor = 'col-resize';
+  e.preventDefault();
+});
+document.addEventListener("mousemove", e => {
+  if (!leftResizing) return;
+  const newW = Math.max(250, Math.min(e.clientX, window.innerWidth - 400));
+  treePanel.style.width = newW + "px";
+  treePanel.style.minWidth = newW + "px";
+});

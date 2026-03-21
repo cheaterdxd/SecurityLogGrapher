@@ -53,9 +53,8 @@
 
   /* ── LEFT: Tree Panel ── */
   #tree-panel {
-    width: 400px; min-width: 400px;
+    width: 400px; min-width: 250px;
     display: flex; flex-direction: column;
-    border-right: 1px solid #30363d;
     background: #0d1117;
   }
   #tree-header {
@@ -332,3 +331,10 @@
     transition: background 0.15s;
   }
   #resize-handle:hover { background: #58a6ff; }
+
+  /* Left panel resize handle */
+  #left-resize-handle {
+    width: 4px; background: #21262d; cursor: col-resize;
+    transition: background 0.15s; flex-shrink: 0;
+  }
+  #left-resize-handle:hover { background: #58a6ff; }
