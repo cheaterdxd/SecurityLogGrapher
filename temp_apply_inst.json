@@ -1,0 +1,25 @@
+﻿{
+  "changeName": "add-pid-search",
+  "changeDir": "D:\\Code\\SecurityLogGrapher\\openspec\\changes\\add-pid-search",
+  "schemaName": "spec-driven",
+  "contextFiles": {
+    "proposal": "D:\\Code\\SecurityLogGrapher\\openspec\\changes\\add-pid-search\\proposal.md",
+    "specs": "D:\\Code\\SecurityLogGrapher\\openspec\\changes\\add-pid-search\\specs\\**\\*.md",
+    "design": "D:\\Code\\SecurityLogGrapher\\openspec\\changes\\add-pid-search\\design.md",
+    "tasks": "D:\\Code\\SecurityLogGrapher\\openspec\\changes\\add-pid-search\\tasks.md"
+  },
+  "progress": {
+    "total": 1,
+    "complete": 0,
+    "remaining": 1
+  },
+  "tasks": [
+    {
+      "id": "1",
+      "description": "1.1 Update `app.js`'s `matchNode()` to intercept `pid:<num>` queries and perform strict `n.pid === num` equality checks, bypassing the `.includes` text search.",
+      "done": false
+    }
+  ],
+  "state": "ready",
+  "instruction": "Read context files, work through pending tasks, mark complete as you go.\nPause if you hit blockers or need clarification."
+}

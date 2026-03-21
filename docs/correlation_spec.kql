@@ -1,0 +1,795 @@
+// @@AGENT_SPEC_VERSION: 1.0
+// @@TITLE: Windows Event Log Process Tree Correlation
+// @@PURPOSE: >
+//   Build a causally-correct process tree from Windows Security events 4688,
+//   4663, 4657. Assign every file-access and registry-modification event to
+//   the exact process, user session, and parent-child lineage that caused it.
+//   Safe for multi-machine (fleet) ingestion.
+// @@TARGET_PLATFORMS: ["KQL/Microsoft Sentinel", "Python/pandas", "Spark SQL", "TypeScript"]
+// @@LAST_UPDATED: 2026-03
+//
+// -----------------------------------------------------------------------
+// HOW TO READ THIS FILE (for code agents)
+// -----------------------------------------------------------------------
+// Each logical block is annotated with:
+//   @@STEP       : unique step id, execution order
+//   @@DEPENDS_ON : list of step ids this step reads from
+//   @@INPUTS     : named tables / event streams consumed
+//   @@OUTPUT     : name and schema of the table this step produces
+//   @@KEY        : primary key / composite key of the output table
+//   @@JOIN_TYPE  : type of join (inner / left-outer / self)
+//   @@FALLBACK   : what to do when join condition fails
+//   @@FLAGS      : boolean columns added for downstream anomaly detection
+//   @@NOTES      : edge cases, traps, and why certain decisions were made
+// -----------------------------------------------------------------------
+
+
+// ═══════════════════════════════════════════════════════════════════════
+// SECTION 0 — SCHEMA CONTRACTS
+// @@AGENT_NOTE: >
+//   Declare every field used downstream. If translating to a typed language
+//   (TypeScript, Python dataclass, Spark schema), generate types from here.
+//   All timestamps are UTC. All IDs are strings unless marked int.
+// ═══════════════════════════════════════════════════════════════════════
+
+// @@SCHEMA: RawEvent (source — Windows Security Event Log)
+// {
+//   TimeGenerated  : datetime  -- UTC, when SIEM received the event
+//   TimeCreated    : datetime  -- UTC claim by source machine (may drift)
+//   Computer       : string    -- FQDN or hostname of source machine
+//   EventID        : int       -- Windows Event ID
+//   EventRecordId  : long      -- monotonic per-machine sequence (gap = log loss)
+//   EventData      : string    -- raw XML payload, used for ThreadID extraction
+//
+//   -- Fields present in 4688 (Process Create)
+//   NewProcessId    : string   -- hex PID of created process  e.g. "0x1B44"
+//   ProcessId       : string   -- hex PID of parent process
+//   NewProcessName  : string   -- full path e.g. "C:\Windows\System32\cmd.exe"
+//   CommandLine     : string   -- full command line (requires audit policy)
+//   SubjectLogonId  : string   -- hex LogonId of session that created process
+//   SubjectUserName : string
+//   SubjectUserSid  : string
+//   SubjectDomainName : string
+//
+//   -- Fields present in 4663 (Object Access)
+//   ProcessId       : string   -- hex PID of accessing process
+//   ObjectName      : string   -- full path of accessed file/pipe/object
+//   AccessMask      : string   -- hex bitmask  0x1=read 0x2=write 0x40=delete
+//   SubjectLogonId  : string   -- LogonId of the thread doing the access
+//   SubjectUserName : string
+//
+//   -- Fields present in 4657 (Registry Value Modified)
+//   ProcessId       : string   -- hex PID  (null/"0x0" on WinServer2008)
+//   ProcessName     : string   -- process image path (null on WinServer2008)
+//   ObjectName      : string   -- registry key path
+//   OperationType   : string   -- "%%1904"=new value "%%1905"=existing "%%1906"=deleted
+//   SubjectLogonId  : string
+//   SubjectUserName : string
+//
+//   -- Fields present in 4624 (Logon Success)
+//   TargetLogonId   : string   -- new LogonId created by this logon
+//   TargetUserName  : string
+//   TargetUserSid   : string
+//   LogonType       : int      -- 2=interactive 3=network 5=service 10=RDP
+//   IpAddress       : string   -- source IP (for network logons)
+//   WorkstationName : string
+//   ElevatedToken   : string   -- "%%1843"=yes "%%1842"=no
+//
+//   -- Fields present in 4648 (Explicit Credential Use)
+//   SubjectLogonId  : string
+//   SubjectUserName : string
+//   TargetServerName: string   -- destination hostname
+//   TargetUserName  : string
+//
+//   -- Fields present in 4689 (Process Exit)
+//   ProcessId       : string   -- hex PID of exited process
+//   SubjectLogonId  : string
+//
+//   -- Sysmon Event 8 (CreateRemoteThread)
+//   SourceProcessId : string
+//   SourceThreadId  : string
+//   TargetProcessId : string
+//   NewThreadId     : string
+//   TargetImage     : string
+// }
+
+// @@SCHEMA: WellKnownLogonIds (constant — same on every Windows machine)
+// {
+//   "0x3e7" : "SYSTEM",
+//   "0x3E7" : "SYSTEM",        // case variant
+//   "0x3e4" : "Network Service",
+//   "0x3E4" : "Network Service",
+//   "0x3e5" : "Local Service",
+//   "0x3E5" : "Local Service"
+// }
+// @@AGENT_NOTE: Filter these OUT before any user-session grouping.
+
+
+// ═══════════════════════════════════════════════════════════════════════
+// SECTION 1 — CONFIGURATION
+// ═══════════════════════════════════════════════════════════════════════
+
+// @@STEP: CFG
+// @@OUTPUT: runtime constants (not a table — inject into all steps)
+let LOOK_BACK        = 24h;
+let SEARCH_START     = ago(LOOK_BACK);
+let PID_REUSE_GAP_S  = 30;    // int seconds: two process instances with same PID
+                               // closer than this are treated as PID-reuse, not parent-child
+let REG_WINDOW_S     = 30;    // int seconds: fallback time window for 4657 LogonId join
+let CLOCK_SKEW_MAX_S = 300;   // int seconds: max tolerated clock drift between machines
+let WELL_KNOWN_LOGON = dynamic(["0x3e7","0x3E7","0x3e4","0x3E4","0x3e5","0x3E5"]);
+
+
+// ═══════════════════════════════════════════════════════════════════════
+// SECTION 2 — PRE-FLIGHT CHECKS
+// Run these first. If they emit rows, adjust JOIN windows before proceeding.
+// ═══════════════════════════════════════════════════════════════════════
+
+// @@STEP: CHECK_CLOCK_SKEW
+// @@DEPENDS_ON: [CFG]
+// @@INPUTS: [SecurityEvent where EventID in (4624, 4688)]
+// @@OUTPUT: ClockSkewReport { Computer, avg_skew_s, max_skew_s, has_issue }
+// @@NOTES: >
+//   TimeGenerated = UTC timestamp Sentinel received the event (ground truth).
+//   TimeCreated   = UTC timestamp the source machine claims (may be wrong).
+//   Difference > CLOCK_SKEW_MAX_S means time-window JOINs may mis-order events.
+//   When has_issue=true, expand REG_WINDOW_S and PID_REUSE_GAP_S by max_skew_s.
+let ClockSkewReport = SecurityEvent
+| where TimeGenerated >= SEARCH_START
+| where EventID in (4624, 4688)
+| extend skew_s = datetime_diff('second', TimeGenerated, TimeCreated)
+| summarize
+    avg_skew_s  = round(avg(skew_s), 1),
+    max_skew_s  = max(abs(skew_s)),
+    event_count = count()
+    by Computer
+| extend has_issue = max_skew_s > CLOCK_SKEW_MAX_S
+| project Computer, avg_skew_s, max_skew_s, event_count, has_issue;
+
+// @@STEP: CHECK_LOG_GAPS
+// @@DEPENDS_ON: [CFG]
+// @@INPUTS: [SecurityEvent where EventID == 4688]
+// @@OUTPUT: LogGapReport { Computer, gap_count, Warning }
+// @@NOTES: >
+//   EventRecordId is a per-machine monotonic counter.
+//   Gaps mean 4688 events were lost — those processes will appear as
+//   orphans in the tree even though they have a real parent.
+//   Annotate orphan nodes with this before concluding "unknown parent".
+let LogGapReport = SecurityEvent
+| where TimeGenerated >= SEARCH_START
+| where EventID == 4688
+| summarize
+    min_id  = min(EventRecordId),
+    max_id  = max(EventRecordId),
+    actual  = count()
+    by Computer
+| extend
+    expected  = max_id - min_id + 1,
+    gap_count = (max_id - min_id + 1) - actual
+| where gap_count > 0
+| project Computer, min_id, max_id, actual, expected, gap_count,
+          Warning = "4688 EventRecordId gaps — orphan nodes may be false";
+
+
+// ═══════════════════════════════════════════════════════════════════════
+// SECTION 3 — CORE TABLE: ProcessTable
+// ═══════════════════════════════════════════════════════════════════════
+
+// @@STEP: BUILD_PROCESS_TABLE
+// @@DEPENDS_ON: [CFG]
+// @@INPUTS: [SecurityEvent where EventID == 4688]
+// @@OUTPUT: ProcessTable
+// @@KEY: (machine, process_key)  where process_key = machine + "|" + hex_pid
+// @@SCHEMA_OUT: {
+//   birth_time    : datetime   -- TimeCreated of 4688 event
+//   machine       : string     -- Computer (hostname)
+//   process_key   : string     -- "{machine}|{NewProcessId}"  COMPOSITE — fleet-unique
+//   parent_key    : string     -- "{machine}|{ProcessId}"     MUST share same machine
+//   pid           : long       -- integer PID
+//   parent_pid    : long
+//   proc_name     : string     -- full image path
+//   cmd_line      : string     -- may be empty if audit policy missing
+//   logon_scope   : string     -- "{machine}|{SubjectLogonId}"  scoped LogonId
+//   logon_id      : string     -- raw SubjectLogonId hex
+//   user_name     : string
+//   user_sid      : string
+//   domain        : string
+//   spawning_tid  : long       -- ThreadID that ran CreateProcess (from XML header)
+//   record_id     : long       -- EventRecordId for gap analysis
+// }
+// @@NOTES: >
+//   TRAP 1 — Never use bare PID as join key across machines.
+//            PID 1234 on MACHINE-A is unrelated to PID 1234 on MACHINE-B.
+//            Always use process_key = machine + "|" + pid.
+//   TRAP 2 — Never use bare LogonId across machines.
+//            LogonId 0x3A4F2 is only unique within one machine + boot cycle.
+//            Always use logon_scope = machine + "|" + logon_id.
+//   TRAP 3 — spawning_tid is in the XML System header, NOT the event body fields.
+//            Extract with regex: <Execution ... ThreadID="(\d+)"
+let ProcessTable = SecurityEvent
+| where TimeGenerated >= SEARCH_START
+| where EventID == 4688
+| extend
+    process_key  = strcat(Computer, "|", NewProcessId),
+    parent_key   = strcat(Computer, "|", ProcessId),
+    pid          = tolong(NewProcessId),
+    parent_pid   = tolong(ProcessId),
+    machine      = Computer,
+    logon_scope  = strcat(Computer, "|", SubjectLogonId),
+    logon_id     = SubjectLogonId,
+    user_sid     = SubjectUserSid,
+    user_name    = SubjectUserName,
+    domain       = SubjectDomainName,
+    proc_name    = NewProcessName,
+    cmd_line     = CommandLine,
+    birth_time   = TimeCreated,
+    record_id    = EventRecordId,
+    spawning_tid = tolong(extract(@'<Execution\s[^>]*ThreadID="(\d+)"', 1, EventData))
+| project birth_time, machine, process_key, parent_key,
+          pid, parent_pid, proc_name, cmd_line,
+          logon_scope, logon_id, user_sid, user_name, domain,
+          spawning_tid, record_id;
+
+
+// ═══════════════════════════════════════════════════════════════════════
+// SECTION 4 — CORE TABLE: ProcessTreeTable (self-join for parent info)
+// ═══════════════════════════════════════════════════════════════════════
+
+// @@STEP: BUILD_PROCESS_TREE
+// @@DEPENDS_ON: [BUILD_PROCESS_TABLE]
+// @@INPUTS: [ProcessTable self-join]
+// @@OUTPUT: ProcessTreeTable
+// @@JOIN_TYPE: left-outer self-join
+// @@JOIN_CONDITION: child.parent_key == parent.process_key
+//                  AND child.birth_time >= parent.birth_time
+// @@KEY: (machine, process_key)
+// @@SCHEMA_OUT: ProcessTable + {
+//   parent_name       : string   -- proc_name of parent (null if orphan)
+//   parent_cmd        : string
+//   parent_user       : string
+//   parent_logon_scope: string
+//   is_orphan         : bool     -- true when parent not found in window
+//   possible_pid_reuse: bool     -- true when parent birth < PID_REUSE_GAP_S before child
+// }
+// @@NOTES: >
+//   PID REUSE — Windows recycles PIDs after process exit.
+//   If two 4688 events share the same PID on the same machine, take the one
+//   with birth_time closest-but-before the child's birth_time as the parent.
+//   Use arg_max(parent_birth, *) after the join to enforce this.
+//
+//   ORPHAN CAUSES (ordered by likelihood):
+//     1. Parent process started before SEARCH_START window
+//     2. EventRecordId gap — 4688 was dropped (see LogGapReport)
+//     3. PPID Spoofing (see SECTION 8) — attacker faked ParentProcessId
+//   Do NOT conclude "malicious" from orphan alone — check LogGapReport first.
+let ProcessTreeTable = ProcessTable
+| join kind=leftouter (
+    ProcessTable
+    | project
+        p_process_key  = process_key,
+        p_birth        = birth_time,
+        p_pid          = pid,
+        p_name         = proc_name,
+        p_cmd          = cmd_line,
+        p_logon_scope  = logon_scope,
+        p_user         = user_name
+) on $left.parent_key == $right.p_process_key
+| where isempty(p_birth) or birth_time >= p_birth
+| summarize arg_max(p_birth, *) by birth_time, process_key, proc_name
+| extend
+    is_orphan          = isempty(p_name),
+    possible_pid_reuse = isnotempty(p_birth)
+        and datetime_diff('second', birth_time, p_birth) < PID_REUSE_GAP_S
+| project
+    birth_time, machine, process_key, parent_key,
+    pid, parent_pid, proc_name, cmd_line,
+    logon_scope, logon_id, user_name, domain, spawning_tid,
+    parent_name    = p_name,
+    parent_cmd     = p_cmd,
+    parent_user    = p_user,
+    parent_logon_scope = p_logon_scope,
+    is_orphan, possible_pid_reuse;
+
+
+// ═══════════════════════════════════════════════════════════════════════
+// SECTION 5 — ENRICH: FileAccessTable from Event 4663
+// ═══════════════════════════════════════════════════════════════════════
+
+// @@STEP: ENRICH_FILE_ACCESS
+// @@DEPENDS_ON: [BUILD_PROCESS_TREE]
+// @@INPUTS: [SecurityEvent where EventID == 4663, ProcessTreeTable]
+// @@OUTPUT: FileAccessEnriched
+// @@JOIN_TYPE: inner
+// @@JOIN_CONDITION: strcat(Computer,"|",ProcessId) == ProcessTreeTable.process_key
+//                  AND TimeCreated >= birth_time
+// @@KEY: (machine, event_time, process_key, object_name)
+// @@SCHEMA_OUT: EnrichedEvent (see bottom of file)
+// @@FLAGS: {
+//   is_sequential    : bool  -- same TID as spawning_tid → direct causal chain
+//   logonid_mismatch : bool  -- event SubjectLogonId != process logon_scope
+//                               → token impersonation likely
+// }
+// @@NOTES: >
+//   4663 ALWAYS has SubjectLogonId and ProcessId — no fallback needed.
+//
+//   is_sequential = true means:
+//     The same OS thread that called CreateProcess also called this file access.
+//     This is strong causal evidence (not just temporal correlation).
+//
+//   logonid_mismatch = true means:
+//     The thread is running under an impersonation token different from
+//     the process primary token. The "real actor" is EffectiveUser, not ProcessOwner.
+//     Report BOTH in output.
+//
+//   AccessMask decode (hex bitmask — multiple bits can be set):
+//     0x1        ReadData / ListDirectory
+//     0x2        WriteData / AddFile
+//     0x4        AppendData
+//     0x10       ReadEA
+//     0x20       WriteEA
+//     0x40       Execute / Traverse
+//     0x80       DeleteChild
+//     0x100      ReadAttributes
+//     0x200      WriteAttributes
+//     0x10000    Delete
+//     0x20000    ReadControl
+//     0x40000    WriteDAC
+//     0x80000    WriteOwner
+//     0x100000   Synchronize
+let FileAccessEnriched = SecurityEvent
+| where TimeGenerated >= SEARCH_START
+| where EventID == 4663
+| extend
+    ev_process_key = strcat(Computer, "|", ProcessId),
+    ev_logon_scope = strcat(Computer, "|", SubjectLogonId),
+    ev_user        = SubjectUserName,
+    ev_object      = ObjectName,
+    ev_access      = AccessMask,
+    ev_time        = TimeCreated,
+    ev_machine     = Computer,
+    ev_tid         = tolong(extract(@'<Execution\s[^>]*ThreadID="(\d+)"', 1, EventData))
+| join kind=inner (ProcessTreeTable) on $left.ev_process_key == $right.process_key
+| where ev_time >= birth_time
+| extend
+    is_sequential    = (ev_tid == spawning_tid),
+    logonid_mismatch = (ev_logon_scope != logon_scope)
+| project
+    event_type        = "FileAccess",
+    machine           = ev_machine,
+    event_time        = ev_time,
+    tid               = ev_tid,
+    is_sequential,
+    join_quality      = "L1_ProcessId",   // 4663 always has ProcessId
+    process_key       = ev_process_key,
+    process_name      = proc_name,
+    command_line      = cmd_line,
+    process_owner     = user_name,        // who owns the process token
+    effective_user    = ev_user,          // who the thread is impersonating (may differ)
+    logon_scope,
+    logon_id,
+    parent_pid,
+    parent_name,
+    parent_cmd,
+    detail            = strcat("file=", ev_object, " access=", ev_access),
+    logonid_mismatch,
+    is_orphan,
+    possible_pid_reuse;
+
+
+// ═══════════════════════════════════════════════════════════════════════
+// SECTION 6 — ENRICH: RegistryTable from Event 4657
+// ═══════════════════════════════════════════════════════════════════════
+
+// @@STEP: ENRICH_REGISTRY
+// @@DEPENDS_ON: [BUILD_PROCESS_TREE]
+// @@INPUTS: [SecurityEvent where EventID == 4657, ProcessTreeTable]
+// @@OUTPUT: RegistryEnriched
+// @@JOIN_TYPE: 3-level priority cascade
+// @@KEY: (machine, event_time, process_key, reg_key)
+// @@SCHEMA_OUT: EnrichedEvent (same as FileAccessEnriched)
+// @@FLAGS: same as FileAccessEnriched + join_quality (L1/L2/L3)
+//
+// @@JOIN_LOGIC: >
+//   L1 (BEST) : ProcessId not null/0x0  AND  ProcessName matches proc_name
+//     → confident: same process instance, name confirmed
+//   L2 (WARN) : ProcessId not null/0x0  BUT  ProcessName does not match
+//     → ProcessId matched but name differs → likely PID reuse
+//     → flag join_quality="L2_PID_NameMismatch" for human review
+//   L3 (WEAK) : ProcessId is null or 0x0  (WinServer 2008 / old OS)
+//     → fallback: join on logon_scope + time window [birth_time, birth_time+REG_WINDOW_S]
+//     → take process with birth_time closest-before reg_time in that session
+//     → flag join_quality="L3_LogonId_Fallback"
+//
+// @@NOTES: >
+//   Always cross-check 4657.ProcessName against ProcessTable.proc_name after join.
+//   Mismatch on L1 is impossible by definition — but if data is dirty, treat as L2.
+//   OperationType decode:
+//     "%%1904" → New registry value created
+//     "%%1905" → Existing registry value modified
+//     "%%1906" → Registry value deleted
+let RegistryRaw = SecurityEvent
+| where TimeGenerated >= SEARCH_START
+| where EventID == 4657
+| extend
+    reg_process_key = strcat(Computer, "|", ProcessId),
+    reg_logon_scope = strcat(Computer, "|", SubjectLogonId),
+    reg_pid         = tolong(ProcessId),
+    reg_procname    = ProcessName,
+    reg_logonid     = SubjectLogonId,
+    reg_user        = SubjectUserName,
+    reg_key         = ObjectName,
+    reg_op          = OperationType,
+    reg_time        = TimeCreated,
+    reg_machine     = Computer,
+    reg_tid         = tolong(extract(@'<Execution\s[^>]*ThreadID="(\d+)"', 1, EventData));
+
+let Reg_L1 = RegistryRaw
+| where isnotempty(reg_pid) and reg_pid != 0
+| join kind=inner (ProcessTreeTable) on $left.reg_process_key == $right.process_key
+| where reg_time >= birth_time
+| where isempty(reg_procname) or reg_procname == proc_name
+| extend join_quality = "L1_PID+Name";
+
+let Reg_L2 = RegistryRaw
+| where isnotempty(reg_pid) and reg_pid != 0
+| join kind=inner (ProcessTreeTable) on $left.reg_process_key == $right.process_key
+| where reg_time >= birth_time
+| where isnotempty(reg_procname) and reg_procname != proc_name
+| extend join_quality = "L2_PID_NameMismatch_ReviewReuse";
+
+let Reg_L3 = RegistryRaw
+| where isempty(reg_pid) or reg_pid == 0
+| join kind=inner (ProcessTreeTable) on $left.reg_logon_scope == $right.logon_scope
+| where reg_time between (birth_time .. (birth_time + REG_WINDOW_S * 1s))
+| summarize arg_max(birth_time, *) by reg_time, reg_key, reg_machine
+| extend join_quality = "L3_LogonId_Fallback";
+
+let RegistryEnriched =
+    Reg_L1 | union Reg_L2 | union Reg_L3
+| extend
+    is_sequential    = (reg_tid == spawning_tid),
+    logonid_mismatch = (reg_logon_scope != logon_scope)
+| project
+    event_type     = "RegistryMod",
+    machine,
+    event_time     = reg_time,
+    tid            = reg_tid,
+    is_sequential,
+    join_quality,
+    process_key    = reg_process_key,
+    process_name   = proc_name,
+    process_name_raw = reg_procname,    // raw from 4657 — use for L2 analysis
+    command_line   = cmd_line,
+    process_owner  = user_name,
+    effective_user = reg_user,
+    logon_scope,
+    logon_id,
+    parent_pid,
+    parent_name,
+    parent_cmd,
+    detail         = strcat("reg_key=", reg_key, " op=", reg_op),
+    logonid_mismatch,
+    is_orphan,
+    possible_pid_reuse;
+
+
+// ═══════════════════════════════════════════════════════════════════════
+// SECTION 7 — FINAL OUTPUT: Unified Enriched Timeline
+// ═══════════════════════════════════════════════════════════════════════
+
+// @@STEP: BUILD_TIMELINE
+// @@DEPENDS_ON: [ENRICH_FILE_ACCESS, ENRICH_REGISTRY, CFG]
+// @@INPUTS: [FileAccessEnriched, RegistryEnriched, SecurityEvent where EventID==4624]
+// @@OUTPUT: EnrichedTimeline  (primary output for analysts and downstream agents)
+// @@KEY: (machine, logon_scope, event_time, process_key, detail)
+// @@SORT: machine ASC, logon_scope ASC, event_time ASC
+// @@SCHEMA_OUT: {
+//   machine           : string
+//   event_time        : datetime
+//   logon_scope       : string   -- "{machine}|{logon_id}"  fleet-unique session key
+//   logon_type        : string   -- human-readable logon type
+//   source_ip         : string   -- where this session originated (network logons)
+//   process_owner     : string   -- who owns the process primary token
+//   effective_user    : string   -- who the thread runs as (may differ if impersonating)
+//   tid               : long
+//   is_sequential     : bool
+//   join_quality      : string   -- L1/L2/L3
+//   logonid_mismatch  : bool     -- impersonation indicator
+//   possible_pid_reuse: bool
+//   is_orphan         : bool
+//   parent_name       : string
+//   parent_cmd        : string
+//   process_name      : string
+//   command_line      : string
+//   event_type        : string   -- "FileAccess" | "RegistryMod"
+//   detail            : string   -- file path+access or reg key+op
+// }
+// @@NOTES: >
+//   Filter WELL_KNOWN_LOGON before grouping — 0x3E7 (SYSTEM) appears on every
+//   machine and must NOT be used as a user-session discriminator.
+//   SessionInfo join is left-outer: events from service sessions (no 4624) will
+//   have null logon_type and source_ip — that is correct and expected.
+let SessionInfo = SecurityEvent
+| where TimeGenerated >= SEARCH_START
+| where EventID == 4624
+| extend logon_scope = strcat(Computer, "|", TargetLogonId)
+| project
+    logon_scope,
+    logon_type  = case(
+        LogonType == 2,  "Interactive",
+        LogonType == 3,  "Network",
+        LogonType == 4,  "Batch",
+        LogonType == 5,  "Service",
+        LogonType == 7,  "Unlock",
+        LogonType == 8,  "NetworkCleartext",
+        LogonType == 9,  "NewCredentials",
+        LogonType == 10, "RemoteInteractive_RDP",
+        LogonType == 11, "CachedInteractive",
+        strcat("Other_", LogonType)),
+    source_ip   = IpAddress,
+    logon_time  = TimeCreated;
+
+FileAccessEnriched
+| union RegistryEnriched
+| where logon_id !in (WELL_KNOWN_LOGON)
+| join kind=leftouter (SessionInfo) on logon_scope
+| project
+    machine, event_time, logon_scope, logon_type, source_ip,
+    process_owner, effective_user, tid, is_sequential,
+    join_quality, logonid_mismatch, possible_pid_reuse, is_orphan,
+    parent_name, parent_cmd, process_name, command_line,
+    event_type, detail
+| sort by machine asc, logon_scope asc, event_time asc;
+
+
+// ═══════════════════════════════════════════════════════════════════════
+// SECTION 8 — ANOMALY DETECTORS (run independently, not part of main timeline)
+// ═══════════════════════════════════════════════════════════════════════
+
+// @@STEP: DETECT_PPID_SPOOF
+// @@DEPENDS_ON: [BUILD_PROCESS_TREE]
+// @@INPUTS: [ProcessTreeTable, SecurityEvent where EventID==4689]
+// @@OUTPUT: PPIDSpoofCandidates { machine, child_pid, child_name, parent_pid, parent_died, Severity }
+// @@NOTES: >
+//   PPID Spoofing: attacker uses CreateProcess with PROC_THREAD_ATTRIBUTE_PARENT_PROCESS
+//   to set an arbitrary ParentProcessId in 4688, making malware appear to be a child
+//   of explorer.exe or another trusted process.
+//
+//   DETECTION LOGIC:
+//     If parent has a 4689 (exit) event with death_time < child birth_time,
+//     the parent was already dead when the child was "born" — physically impossible
+//     without spoofing.
+//
+//   FALSE POSITIVE: if log collection started mid-session, parent's 4689 may appear
+//   in window while its 4688 does not → is_orphan=true helps distinguish.
+let ProcessDeaths = SecurityEvent
+| where TimeGenerated >= SEARCH_START
+| where EventID == 4689
+| extend
+    dead_key   = strcat(Computer, "|", ProcessId),
+    death_time = TimeCreated;
+
+ProcessTreeTable
+| join kind=inner (ProcessDeaths) on $left.parent_key == $right.dead_key
+| where birth_time > death_time
+| project
+    birth_time, machine,
+    child_pid   = pid,
+    child_name  = proc_name,
+    child_cmd   = cmd_line,
+    parent_pid,
+    parent_name,
+    parent_died = death_time,
+    Severity    = "HIGH",
+    Note        = "Parent exited before child spawned — PPID spoof candidate";
+
+
+// @@STEP: DETECT_UAC_TOKEN_SPLIT
+// @@DEPENDS_ON: [CFG]
+// @@INPUTS: [SecurityEvent where EventID==4624]
+// @@OUTPUT: UACTokenPairs { Computer, UserName, StandardScope, ElevatedScope }
+// @@NOTES: >
+//   UAC creates two separate LogonId values for the same user login:
+//     ElevatedToken="%%1843" (Yes) → admin token  → runs UAC-elevated processes
+//     ElevatedToken="%%1842" (No)  → standard token → runs normal processes
+//   Without linking these pairs, half the user's actions are invisible when
+//   grouping by logon_scope.
+//   Link condition: same machine + same username + 4624 events within 60 seconds.
+//   Use UACTokenPairs to merge logon_scope variants before user-level reporting.
+let Elevated = SecurityEvent
+| where TimeGenerated >= SEARCH_START and EventID == 4624
+| where ElevatedToken == "%%1843"
+| extend scope = strcat(Computer, "|", TargetLogonId), ts = TimeCreated;
+
+let Standard = SecurityEvent
+| where TimeGenerated >= SEARCH_START and EventID == 4624
+| where ElevatedToken == "%%1842"
+| extend scope = strcat(Computer, "|", TargetLogonId), ts = TimeCreated;
+
+Elevated
+| join kind=inner (Standard) on $left.TargetUserName == $right.TargetUserName,
+                                $left.Computer == $right.Computer
+| where abs(datetime_diff('second', ts, ts1)) < 60
+| project
+    Computer,
+    UserName       = TargetUserName,
+    StandardScope  = scope1,
+    ElevatedScope  = scope,
+    TimeDiff_s     = abs(datetime_diff('second', ts, ts1));
+
+
+// @@STEP: DETECT_LATERAL_MOVEMENT
+// @@DEPENDS_ON: [CFG]
+// @@INPUTS: [SecurityEvent where EventID in (4648, 4624)]
+// @@OUTPUT: LateralMovementChain { LateralTime, SourceMachine, TargetMachine, User, ... }
+// @@NOTES: >
+//   Lateral movement leaves a two-machine footprint:
+//     SOURCE machine: Event 4648 (explicit credential) with TargetServerName = TARGET
+//     TARGET machine: Event 4624 LogonType 3 or 10, IpAddress = SOURCE's IP
+//
+//   JOIN CONDITIONS (all must hold):
+//     1. src.TargetServerName == tgt.Computer (hostname match)
+//     2. src.TargetUserName   == tgt.TargetUserName (same user)
+//     3. tgt.TimeCreated between [src.TimeCreated, src.TimeCreated + 5min]
+//
+//   After finding the chain, join ProcessTreeTable for BOTH machines using
+//   SourceLogonScope and TargetLogonScope to build unified kill-chain timeline.
+//
+//   LIMITATION: Requires hostname in 4648.TargetServerName to match Computer field
+//   in 4624. DNS aliases or IP-only entries will miss. Add IP→hostname lookup table
+//   if available.
+let LateralSrc = SecurityEvent
+| where TimeGenerated >= SEARCH_START and EventID == 4648
+| extend
+    src_logon_scope = strcat(Computer, "|", SubjectLogonId),
+    src_machine     = Computer
+| project lateral_time=TimeCreated, src_machine, src_logon_scope,
+          src_user=SubjectUserName, target_server=TargetServerName,
+          target_user=TargetUserName;
+
+let LateralTgt = SecurityEvent
+| where TimeGenerated >= SEARCH_START and EventID == 4624
+| where LogonType in (3, 10)
+| extend tgt_logon_scope = strcat(Computer, "|", TargetLogonId)
+| project inbound_time=TimeCreated, tgt_machine=Computer,
+          tgt_logon_scope, tgt_user=TargetUserName, source_ip=IpAddress;
+
+LateralSrc
+| join kind=inner (LateralTgt) on
+    $left.target_server == $right.tgt_machine,
+    $left.target_user   == $right.tgt_user
+| where inbound_time between (lateral_time .. (lateral_time + 5min))
+| project
+    LateralTime      = lateral_time,
+    SourceMachine    = src_machine,
+    SourceLogonScope = src_logon_scope,
+    TargetMachine    = tgt_machine,
+    TargetLogonScope = tgt_logon_scope,
+    User             = src_user,
+    Note             = "Lateral movement — link source and target ProcessTreeTable by LogonScope";
+
+
+// @@STEP: DETECT_THREAD_INJECTION
+// @@DEPENDS_ON: [BUILD_PROCESS_TREE]
+// @@INPUTS: [SecurityEvent where EventID==8 (Sysmon CreateRemoteThread), ProcessTreeTable]
+// @@OUTPUT: ThreadInjectionAlerts { machine, source_name, source_tid, target_name, injected_tid, Severity }
+// @@NOTES: >
+//   Sysmon Event 8 fires when a thread is created in a DIFFERENT process.
+//   SourceProcessId != TargetProcessId is the defining condition.
+//   Critical targets (lsass, winlogon, csrss) indicate credential dumping.
+//   JOIN uses composite key (machine + PID) — never bare PID.
+SecurityEvent
+| where TimeGenerated >= SEARCH_START and EventID == 8
+| extend
+    src_key     = strcat(Computer, "|", SourceProcessId),
+    tgt_key     = strcat(Computer, "|", TargetProcessId),
+    inj_machine = Computer
+| where SourceProcessId != TargetProcessId
+| join kind=leftouter (ProcessTreeTable | project process_key, src_name=proc_name, src_user=user_name) on $left.src_key == $right.process_key
+| join kind=leftouter (ProcessTreeTable | project process_key, tgt_name=proc_name) on $left.tgt_key == $right.process_key
+| project
+    TimeCreated,
+    Machine     = inj_machine,
+    SourceName  = src_name,
+    SourceTID   = SourceThreadId,
+    SourceUser  = src_user,
+    TargetName  = tgt_name,
+    InjectedTID = NewThreadId,
+    Severity    = iff(TargetImage has_any ("lsass","winlogon","csrss"), "CRITICAL", "HIGH");
+
+
+// @@STEP: DETECT_LOG_TAMPERING
+// @@DEPENDS_ON: [BUILD_PROCESS_TREE]
+// @@INPUTS: [SecurityEvent where EventID in (1102, 4719)]
+// @@OUTPUT: LogTamperingAlerts + annotated orphans
+// @@NOTES: >
+//   1102 = Security audit log was cleared. Anything before this timestamp is gone.
+//   4719 = System audit policy was changed. Logging may have been disabled silently.
+//   When tampering is detected, cross-reference with is_orphan=true nodes whose
+//   birth_time is within 30 minutes of the tamper event — those orphans are likely
+//   caused by deleted parent events, not PPID spoofing.
+SecurityEvent
+| where TimeGenerated >= SEARCH_START
+| where EventID in (1102, 4719)
+| extend
+    tamper_scope = strcat(Computer, "|", SubjectLogonId),
+    tamper_type  = iff(EventID==1102, "LOG_CLEARED", "AUDIT_POLICY_CHANGED")
+| project
+    TimeCreated, Computer, tamper_type,
+    SubjectUser = SubjectUserName, tamper_scope, Severity = "CRITICAL";
+
+
+// @@STEP: DETECT_LOLBINS
+// @@DEPENDS_ON: [BUILD_PROCESS_TREE]
+// @@INPUTS: [ProcessTreeTable]
+// @@OUTPUT: LOLBinsAlerts { machine, process_name, command_line, suspicion_reason, Severity }
+// @@NOTES: >
+//   LOLBins (Living-off-the-Land Binaries) are legitimate Windows executables
+//   used maliciously. The 4688 process tree looks normal — detection requires
+//   CommandLine content analysis.
+//   Extend the list below with environment-specific approved uses to reduce FP.
+//   This is a starting set — not exhaustive.
+ProcessTreeTable
+| extend suspicion_reason = case(
+    proc_name has "certutil"      and cmd_line has "-urlcache",         "CertUtil_download",
+    proc_name has "certutil"      and cmd_line has "-decode",            "CertUtil_decode",
+    proc_name has "mshta"         and cmd_line has "http",               "MSHTA_remote",
+    proc_name has "regsvr32"      and cmd_line has "/s /u /i:",          "Squiblydoo",
+    proc_name has "rundll32"      and cmd_line has "javascript:",        "Rundll32_JS",
+    proc_name has "powershell"    and cmd_line has "-enc",               "PS_encoded",
+    proc_name has "powershell"    and cmd_line has "-w hidden",          "PS_hidden",
+    proc_name has "powershell"    and cmd_line has "IEX",                "PS_invoke_expr",
+    proc_name has "wmic"          and cmd_line has "process call create","WMIC_spawn",
+    proc_name has "bitsadmin"     and cmd_line has "/transfer",          "BITS_download",
+    proc_name has "installutil"   and isnotempty(cmd_line),              "InstallUtil_exec",
+    proc_name has "msiexec"       and cmd_line has "http",               "MSIExec_remote",
+    ""
+)
+| where isnotempty(suspicion_reason)
+| project
+    birth_time, machine, pid, proc_name, cmd_line,
+    user_name, parent_name, suspicion_reason, Severity = "HIGH";
+
+
+// ═══════════════════════════════════════════════════════════════════════
+// SECTION 9 — AGENT IMPLEMENTATION GUIDE
+// @@AGENT_NOTE: >
+//   When translating this spec to another language, implement steps in this order:
+//
+//   PHASE 1 — Pre-flight (run once, check before proceeding)
+//     CHECK_CLOCK_SKEW    → if has_issue: widen time windows by max_skew_s
+//     CHECK_LOG_GAPS      → store gap ranges; use in orphan classification
+//
+//   PHASE 2 — Core tables (required for all enrichment)
+//     BUILD_PROCESS_TABLE → produces ProcessTable (immutable after this step)
+//     BUILD_PROCESS_TREE  → produces ProcessTreeTable (immutable after this step)
+//
+//   PHASE 3 — Enrichment (can run in parallel after Phase 2)
+//     ENRICH_FILE_ACCESS  → consumes ProcessTreeTable + 4663 events
+//     ENRICH_REGISTRY     → consumes ProcessTreeTable + 4657 events (3-level cascade)
+//
+//   PHASE 4 — Output
+//     BUILD_TIMELINE      → union Phase 3 outputs + session info join
+//
+//   PHASE 5 — Anomaly detectors (independent, consume Phase 2 output)
+//     DETECT_PPID_SPOOF
+//     DETECT_UAC_TOKEN_SPLIT
+//     DETECT_LATERAL_MOVEMENT
+//     DETECT_THREAD_INJECTION
+//     DETECT_LOG_TAMPERING
+//     DETECT_LOLBINS
+//
+//   KEY INVARIANTS (assert these in tests):
+//     1. Every row in EnrichedTimeline has machine != null
+//     2. Every row has logon_scope matching pattern r"^[^|]+\|0x[0-9a-fA-F]+"
+//     3. No logon_id in WELL_KNOWN_LOGON appears in EnrichedTimeline
+//     4. join_quality is always one of {"L1_ProcessId","L1_PID+Name","L2_PID_NameMismatch_ReviewReuse","L3_LogonId_Fallback"}
+//     5. event_time >= birth_time for every enriched event
+//     6. process_key always starts with machine value (composite key integrity)
+//
+//   DATA MODEL SUMMARY:
+//     ProcessTable      1──────< ProcessTreeTable (self-referencing tree)
+//     ProcessTreeTable  1──────< FileAccessEnriched  (via process_key)
+//     ProcessTreeTable  1──────< RegistryEnriched    (via process_key or logon_scope)
+//     SessionInfo       1──────< EnrichedTimeline     (via logon_scope)
+// ═══════════════════════════════════════════════════════════════════════

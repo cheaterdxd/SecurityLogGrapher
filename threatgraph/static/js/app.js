@@ -123,8 +123,7 @@ function startSSE(taskId) {
 
 function processEvent(ev) {
   eventCount++;
-  const childId = `pid_${ev.pid}`;
-  const parentId = `pid_${ev.ppid}`;
+  const childId = ev.process_key || `pid_${ev.pid}`;
   
   // 1. Child node creation/update
   if (!nodes[childId]) {
@@ -141,18 +140,43 @@ function processEvent(ev) {
     raw_xml: ev.raw_xml,
     node_type: ev.node_type,
     object_name: ev.object_name,
-    is_root: false
+    process_key: ev.process_key,
+    parent_key: ev.parent_key,
+    is_orphan: ev.is_orphan,
+    possible_pid_reuse: ev.possible_pid_reuse,
+    logonid_mismatch: ev.logonid_mismatch,
+    is_sequential: ev.is_sequential,
+    logon_id: ev.logon_id,
+    anomaly_lolbin: ev.anomaly_lolbin,
+    anomaly_ppid_spoof: ev.anomaly_ppid_spoof,
+    anomaly_uac_split: ev.anomaly_uac_split,
+    user_name: ev.user_name,
+    domain: ev.domain,
+    elevated: ev.elevated,
+    linked_id: ev.linked_id,
+    exit_status: ev.exit_status,
+    is_root: ev.parent_key === null ? true : false
   });
+  
+  if (ev.parent_key === null) {
+      roots.add(childId);
+      return;
+  }
+  
   roots.delete(childId); // definitely not a root
+
+  const parentId = ev.parent_key || `pid_${ev.ppid}`;
 
   // 2. Parent node creation if missing
   if (!nodes[parentId]) {
+    const isSess = parentId.startsWith("logon_");
     nodes[parentId] = {
       id: parentId,
-      label: `PID ${ev.ppid}`,
-      short_name: `PID ${ev.ppid}`,
-      pid: ev.ppid,
+      label: isSess ? `Logon ID ${ev.logon_id || parentId}` : `PID ${ev.ppid}`,
+      short_name: isSess ? `Session ${ev.logon_id || parentId.replace('logon_','')}` : `PID ${ev.ppid}`,
+      pid: isSess ? parentId : ev.ppid,
       timestamp: ev.timestamp,
+      node_type: isSess ? "session" : "process",
       is_root: true
     };
     roots.add(parentId);
@@ -264,6 +288,12 @@ function buildNodeEl(nodeId, depth, filterText) {
   } else if (node.node_type === "registry" || node.node_type === "key") {
     iconClass = "icon-registry";
     iconText = "RG";
+  } else if (node.node_type === "session") {
+    iconClass = "icon-session";
+    iconText = "U";
+  } else if (node.node_type === "exit") {
+    iconClass = "icon-exit";
+    iconText = "X";
   }
   
   ic.className = "node-icon " + iconClass;
@@ -316,10 +346,16 @@ function buildNodeEl(nodeId, depth, filterText) {
 
 function matchNode(n, t) {
   const q = t.toLowerCase();
+  
+  if (q.startsWith("pid:")) {
+    const targetPid = q.substring(4).trim();
+    return String(n.pid).toLowerCase() === targetPid;
+  }
+  
   return n.short_name.toLowerCase().includes(q)
     || n.label.toLowerCase().includes(q)
-    || String(n.pid).includes(q)
-    || (n.event_id && String(n.event_id).includes(q))
+    || String(n.pid).toLowerCase().includes(q)
+    || (n.event_id && String(n.event_id).toLowerCase().includes(q))
     || (n.command_line && n.command_line.toLowerCase().includes(q));
 }
 function subtreeMatches(nid, t, visited) {
@@ -527,18 +563,31 @@ function renderChainGraph(selectedId) {
     .attr("r", d => d.id === selectedId ? 16 : (d.is_root ? 14 : 12))
     .attr("fill", d => {
       if (d.id === selectedId) return "#f0c674";
-      if (!d.node_type || d.node_type === 'process') return d.is_root ? "#e74c3c" : "#3498db";
+      if (!d.node_type || d.node_type === 'process') {
+         if (d.anomaly_lolbin) return "#ff00ff";
+         return d.is_root ? "#e74c3c" : "#3498db";
+      }
       if (d.node_type === 'file') return "#2ea043"; // Git Green
       if (d.node_type === 'registry' || d.node_type === 'key') return "#a371f7"; // Git Purple
+      if (d.node_type === 'session') return "#d35400"; // Orange User
+      if (d.node_type === 'exit') return "#7f8c8d"; // Gray Exit
       return "#8b949e";
     })
-    .attr("stroke", d => d.id === selectedId ? "#fff" : "rgba(255,255,255,0.3)")
-    .attr("stroke-width", d => d.id === selectedId ? 2.5 : 1);
+    .attr("stroke", d => {
+      if (d.id === selectedId) return "#fff";
+      if (d.is_orphan || d.anomaly_ppid_spoof) return "#ff4444";
+      if (d.logonid_mismatch || d.anomaly_uac_split) return "#ff8800";
+      return "rgba(255,255,255,0.3)";
+    })
+    .attr("stroke-dasharray", d => d.possible_pid_reuse ? "4,2" : "none")
+    .attr("stroke-width", d => (d.id === selectedId || d.is_orphan || d.logonid_mismatch || d.anomaly_ppid_spoof || d.anomaly_uac_split) ? 2.5 : 1);
 
   nodeGs.append("text")
     .text(d => {
       if (d.node_type === 'file') return 'F';
       if (d.node_type === 'registry' || d.node_type === 'key') return 'RG';
+      if (d.node_type === 'session') return 'U';
+      if (d.node_type === 'exit') return 'X';
       return 'P';
     })
     .attr("dy", "4")
@@ -575,8 +624,20 @@ function renderChainGraph(selectedId) {
       if (d.node_type === 'file') html += `<div class="tt-sub">AccessList: ${esc(d.access_list || 'None')}</div>`;
       else html += `<div class="tt-sub">NewValue: ${esc(d.new_value || 'None')}</div>`;
       if (ts) html += `<div class="tt-sub" style="margin-top:2px;">Time: ${ts}</div>`;
+    } else if (d.node_type === 'session') {
+      html += `<div class="tt-sub">User: ${esc(d.domain)}\\${esc(d.user_name)}</div>`;
+      html += `<div class="tt-sub">Elevated: ${esc(d.elevated)}</div>`;
+    } else if (d.node_type === 'exit') {
+      html += `<div class="tt-sub">ExitStatus: ${esc(d.exit_status)}</div>`;
     } else {
       html += `<div class="tt-sub">PID: ${d.pid}${ts ? ' · ' + ts : ''}</div>`;
+      if (d.logon_id) html += `<div class="tt-sub" style="color:#ff8800">Logon: ${esc(d.logon_id)}</div>`;
+      if (d.is_orphan) html += `<div class="tt-sub" style="color:#ff4444">⚠ Orphan Process</div>`;
+      if (d.logonid_mismatch) html += `<div class="tt-sub" style="color:#ff8800">⚠ Token Impersonation</div>`;
+      if (d.possible_pid_reuse) html += `<div class="tt-sub" style="color:#f0c674">ℹ Possible PID Reuse</div>`;
+      if (d.anomaly_lolbin) html += `<div class="tt-sub" style="color:#ff00ff">⚠ LOLBin Detected</div>`;
+      if (d.anomaly_ppid_spoof) html += `<div class="tt-sub" style="color:#ff4444">⚠ PPID Spoofing Detected</div>`;
+      if (d.anomaly_uac_split) html += `<div class="tt-sub" style="color:#ff8800">⚠ UAC Token Split</div>`;
     }
     tooltip.innerHTML = html;
     tooltip.style.left = (mx + 14) + "px"; tooltip.style.top = (my - 8) + "px"; tooltip.style.opacity = 1;
@@ -629,10 +690,25 @@ function showInlineInfoBoxes(chainNodes) {
       } else {
         h += `<div style="color:#8b949e; margin-top: 6px; margin-bottom: 2px;">NewValue</div><div style="color:#c9d1d9; background:#0d1117; padding:4px; border-radius:4px; word-break:break-all;">${esc(snode.new_value || 'None')}</div>`;
       }
+    } else if (snode.node_type === 'session') {
+      h += `<div class="row" style="display:flex; justify-content:space-between; margin-bottom: 3px;"><div class="lbl" style="color:#8b949e; width: 40%;">Domain</div><div class="val" style="color:#c9d1d9; width: 60%; word-break: break-all;">${esc(snode.domain)}</div></div>`;
+      h += `<div class="row" style="display:flex; justify-content:space-between; margin-bottom: 3px;"><div class="lbl" style="color:#8b949e; width: 40%;">User</div><div class="val" style="color:#c9d1d9; width: 60%; word-break: break-all;">${esc(snode.user_name)}</div></div>`;
+      h += `<div class="row" style="display:flex; justify-content:space-between; margin-bottom: 3px;"><div class="lbl" style="color:#ff8800; width: 40%;">Logon ID</div><div class="val" style="color:#ff8800; width: 60%; word-break: break-all;">${esc(snode.logon_id || 'Unknown')}</div></div>`;
+      if (snode.anomaly_uac_split) h += `<div style="color:#ff8800; margin-top: 4px; font-size:10px; font-weight:bold;">⚠ UAC TOKEN SPLIT</div>`;
+      h += `<div style="color:#8b949e; margin-top: 6px; margin-bottom: 2px;">Session Details</div><div style="color:#c9d1d9; background:#0d1117; padding:4px; border-radius:4px; word-break:break-all;">${esc(snode.command_line)}</div>`;
+    } else if (snode.node_type === 'exit') {
+      h += `<div class="row" style="display:flex; justify-content:space-between; margin-bottom: 3px;"><div class="lbl" style="color:#8b949e; width: 40%;">Parent PID</div><div class="val" style="color:#c9d1d9; width: 60%; word-break: break-all;">${spid ? esc(spid) : '&nbsp;'}</div></div>`;
+      h += `<div style="color:#8b949e; margin-top: 6px; margin-bottom: 2px;">Exit Status</div><div style="color:#c9d1d9; background:#0d1117; padding:4px; border-radius:4px; word-break:break-all;">${esc(tcmd ? esc(tcmd) : '&nbsp;')}</div>`;
     } else {
       h += `<div class="row" style="display:flex; justify-content:space-between; margin-bottom: 3px;"><div class="lbl" style="color:#8b949e; width: 40%;">Node PID</div><div class="val" style="color:#c9d1d9; width: 60%; word-break: break-all;">${esc(tpid)}</div></div>`;
+      h += `<div class="row" style="display:flex; justify-content:space-between; margin-bottom: 3px;"><div class="lbl" style="color:#ff8800; width: 40%;">Logon ID</div><div class="val" style="color:#ff8800; width: 60%; word-break: break-all;">${esc(snode.logon_id || 'Unknown')}</div></div>`;
       h += `<div class="row" style="display:flex; justify-content:space-between; margin-bottom: 3px;"><div class="lbl" style="color:#8b949e; width: 40%;">Parent PID</div><div class="val" style="color:#c9d1d9; width: 60%; word-break: break-all;">${spid ? esc(spid) : '&nbsp;'}</div></div>`;
       h += `<div class="row" style="display:flex; justify-content:space-between; margin-bottom: 3px;"><div class="lbl" style="color:#8b949e; width: 40%;">Children PIDs</div><div class="val" style="color:#c9d1d9; width: 60%; word-break: break-all;">${childPids ? esc(childPids) : '&nbsp;'}</div></div>`;
+      if (snode.is_orphan) h += `<div style="color:#ff4444; margin-top: 4px; font-size:10px; font-weight:bold;">⚠ ORPHAN PROCESS</div>`;
+      if (snode.possible_pid_reuse) h += `<div style="color:#f0c674; margin-top: 4px; font-size:10px; font-weight:bold;">ℹ POTENTIAL PID REUSE</div>`;
+      if (snode.logonid_mismatch) h += `<div style="color:#ff8800; margin-top: 4px; font-size:10px; font-weight:bold;">⚠ TOKEN IMPERSONATION</div>`;
+      if (snode.anomaly_lolbin) h += `<div style="color:#ff00ff; margin-top: 4px; font-size:10px; font-weight:bold;">⚠ LOLBIN DETECTED</div>`;
+      if (snode.anomaly_ppid_spoof) h += `<div style="color:#ff4444; margin-top: 4px; font-size:10px; font-weight:bold;">⚠ PPID SPOOFING</div>`;
       h += `<div style="color:#8b949e; margin-top: 6px; margin-bottom: 2px;">Source CmdLine</div><div style="color:#c9d1d9; background:#0d1117; padding:4px; border-radius:4px; word-break:break-all;">${scmd ? esc(scmd) : '&nbsp;'}</div>`;
       h += `<div style="color:#8b949e; margin-top: 6px; margin-bottom: 2px;">Target CmdLine</div><div style="color:#c9d1d9; background:#0d1117; padding:4px; border-radius:4px; word-break:break-all;">${tcmd ? esc(tcmd) : '&nbsp;'}</div>`;
     }

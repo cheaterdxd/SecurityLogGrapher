@@ -40,9 +40,16 @@ def run(
     typer.echo(f"Starting ThreatGraph web server at {url}")
     typer.echo("Open this URL in your browser. (Opening automatically...)")
     
-    # Give uvicorn a small delay to start, then open browser
+    # Poll the server until it responds, then open browser
     def _open_browser():
-        time.sleep(1.5)
+        import urllib.request
+        import time
+        for _ in range(20):
+            try:
+                urllib.request.urlopen(url, timeout=0.1)
+                break
+            except Exception:
+                time.sleep(0.25)
         webbrowser.open(url)
         
     threading.Thread(target=_open_browser, daemon=True).start()

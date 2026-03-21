@@ -40,20 +40,26 @@ async def upload_evtx(file: UploadFile = File(...)):
     if not file.filename.lower().endswith(".evtx"):
         raise HTTPException(status_code=400, detail="Only .evtx files are supported.")
 
+    tmp_path = None
     try:
         tmp = NamedTemporaryFile(delete=False, suffix=".evtx")
+        tmp_path = tmp.name
         chunk = await file.read(1024 * 1024)  # 1MB chunks
         while chunk:
             tmp.write(chunk)
             chunk = await file.read(1024 * 1024)
         tmp.close()
-        tmp_path = tmp.name
         
         task_id = Path(tmp_path).name
         logger.info("Saved upload to %s, task ID: %s", tmp_path, task_id)
         return {"task_id": task_id}
     except Exception as e:
         logger.error("Failed to save uploaded file: %s", e)
+        if tmp_path:
+            try:
+                Path(tmp_path).unlink()
+            except OSError:
+                pass
         raise HTTPException(status_code=500, detail="Failed to save uploaded file.")
 
 
@@ -65,12 +71,21 @@ async def stream_evtx(task_id: str):
     Deletes the temporary file upon completion.
     """
     import tempfile
+    
+    # Secure task_id against directory traversal
+    task_id = Path(task_id).name
+    if not task_id.endswith(".evtx"):
+        raise HTTPException(status_code=400, detail="Invalid task ID")
+        
     tmp_path = Path(tempfile.gettempdir()) / task_id
 
     if not tmp_path.exists() or not str(tmp_path).endswith(".evtx"):
         raise HTTPException(status_code=404, detail="Task ID not found or invalid.")
 
     async def event_generator():
+        from threatgraph.correlation.engine import CorrelationEngine
+        engine = CorrelationEngine()
+        
         try:
             raw_events = parse_evtx(str(tmp_path))
             
@@ -80,7 +95,8 @@ async def stream_evtx(task_id: str):
             for raw_xml in raw_events:
                 event = normalize_event(raw_xml)
                 if event is not None:
-                    batch.append(event)
+                    enriched_event = engine.process_event(event)
+                    batch.append(enriched_event)
                     count += 1
                 
                 # yield batch every 200 events to prevent massive JSON lines and keep UI snappy

@@ -1,0 +1,271 @@
+// ============================================================
+// ADDON CHO v3 — Các bề mặt còn thiếu
+// Chạy sau khi đã có ProcessTreeTable từ v3
+// ============================================================
+
+
+// ----------------------------------------------------------------
+// ADDON 1: Token Impersonation Detection
+// Dấu hiệu: 4663/4657 có SubjectLogonId thuộc session X
+//           nhưng ProcessId thuộc process đang chạy dưới session Y
+// → "Effective user" khác "Process owner"
+// ----------------------------------------------------------------
+let ImpersonationEvents = SecurityEvent
+| where TimeGenerated >= SEARCH_START
+| where EventID in (4663, 4657)
+| extend
+    ev_process_key = strcat(Computer, "|", ProcessId),
+    ev_logon_scope = strcat(Computer, "|", SubjectLogonId),
+    ev_user        = SubjectUserName,
+    ev_sid         = SubjectUserSid
+| join kind=inner (
+    ProcessTreeTable
+    | project process_key, proc_logon_scope=logon_scope,
+              proc_user=user_name, proc_name, pid
+) on $left.ev_process_key == $right.process_key
+// Impersonation: user trong event khác với user của process
+| where ev_logon_scope != proc_logon_scope
+// Loại trừ SYSTEM well-known (luôn impersonate)
+| where proc_logon_scope !endswith "|0x3e7"
+    and proc_logon_scope !endswith "|0x3E7"
+| extend
+    effective_user   = ev_user,        // user thực sự thực hiện hành động
+    process_owner    = proc_user,      // user sở hữu process
+    impersonation_flag = true
+| project
+    TimeCreated, Computer, EventID, ProcessName = proc_name,
+    ProcessOwner = process_owner,
+    EffectiveUser = effective_user,
+    ImpersonationFlag = impersonation_flag,
+    ObjectName,
+    Note = "SubjectUser != ProcessOwner — token impersonation detected";
+
+
+// ----------------------------------------------------------------
+// ADDON 2: UAC Elevated Token Split
+// Khi user chạy "Run as Admin", Windows tạo 2 LogonId:
+//   LogonId A → standard token (daily use)
+//   LogonId B → elevated token (admin actions)
+// Cả hai thuộc cùng 1 user nhưng khác LogonId
+// Cần link lại để không mất nửa hành vi
+// ----------------------------------------------------------------
+let ElevatedSessions = SecurityEvent
+| where TimeGenerated >= SEARCH_START
+| where EventID == 4624
+| where ElevatedToken == "%%1843"   // "Yes" — đây là elevated logon
+| extend
+    elevated_scope  = strcat(Computer, "|", TargetLogonId),
+    elevated_user   = TargetUserName,
+    elevated_sid    = TargetUserSid,
+    elevated_time   = TimeCreated;
+
+let StandardSessions = SecurityEvent
+| where TimeGenerated >= SEARCH_START
+| where EventID == 4624
+| where ElevatedToken == "%%1842"   // "No" — standard token
+| extend
+    standard_scope  = strcat(Computer, "|", TargetLogonId),
+    standard_user   = TargetUserName,
+    standard_sid    = TargetUserSid,
+    standard_time   = TimeCreated;
+
+// Link elevated ↔ standard cho cùng user trong khoảng 60s
+let UACTokenPairs = ElevatedSessions
+| join kind=inner (StandardSessions) on
+    $left.elevated_user == $right.standard_user,
+    $left.Computer       == $right.Computer
+| where abs(datetime_diff('second', elevated_time, standard_time)) < 60
+| project
+    Computer,
+    UserName         = elevated_user,
+    StandardScope    = standard_scope,
+    ElevatedScope    = elevated_scope,
+    TimeDiff_s       = abs(datetime_diff('second', elevated_time, standard_time)),
+    Note             = "UAC split — 2 LogonId cho cùng 1 user";
+
+// Dùng UACTokenPairs để merge hành vi từ cả 2 scope
+// khi phân tích timeline của user
+
+
+// ----------------------------------------------------------------
+// ADDON 3: Lateral Movement Bridge
+// Nối hành vi trên MACHINE-A với hành vi trên MACHINE-B
+// Bridge key: IpAddress trong 4624 trên B = IP của A
+//             Username phải khớp
+//             Timestamp: 4624 trên B xảy ra sau 4648 trên A
+// ----------------------------------------------------------------
+
+// Bước 3a: Tìm outbound lateral movement trên SOURCE machine
+let LateralSource = SecurityEvent
+| where TimeGenerated >= SEARCH_START
+| where EventID == 4648   // Explicit credential use — outbound
+| extend
+    src_machine   = Computer,
+    src_logon_key = strcat(Computer, "|", SubjectLogonId),
+    src_user      = SubjectUserName,
+    target_server = TargetServerName,
+    target_user   = TargetUserName,
+    lateral_time  = TimeCreated
+| project lateral_time, src_machine, src_logon_key,
+          src_user, target_server, target_user;
+
+// Bước 3b: Tìm inbound logon trên TARGET machine
+let LateralTarget = SecurityEvent
+| where TimeGenerated >= SEARCH_START
+| where EventID == 4624
+| where LogonType in (3, 10)   // Network hoặc RDP
+| extend
+    tgt_machine     = Computer,
+    tgt_logon_scope = strcat(Computer, "|", TargetLogonId),
+    tgt_user        = TargetUserName,
+    source_ip       = IpAddress,
+    inbound_time    = TimeCreated
+| project inbound_time, tgt_machine, tgt_logon_scope,
+          tgt_user, source_ip;
+
+// Bước 3c: JOIN — source IP từ B phải match hostname A
+// (cần DNS resolution hoặc IP-to-hostname mapping table)
+let LateralMovementChain = LateralSource
+| join kind=inner (LateralTarget) on
+    $left.src_user     == $right.tgt_user,
+    $left.target_server == $right.tgt_machine
+| where inbound_time between (lateral_time .. (lateral_time + 5min))
+| extend
+    // Tổng hợp LogonScope của session MỚI trên target machine
+    pivot_session_scope = tgt_logon_scope
+| project
+    LateralTime        = lateral_time,
+    SourceMachine      = src_machine,
+    SourceLogonScope   = src_logon_key,
+    TargetMachine      = tgt_machine,
+    TargetLogonScope   = tgt_logon_scope,
+    User               = src_user,
+    Note               = "Lateral movement detected — link A→B process trees";
+
+// Sau khi có LateralMovementChain, join ProcessTreeTable của cả 2 máy
+// để dựng unified kill chain timeline
+
+
+// ----------------------------------------------------------------
+// ADDON 4: PPID Spoofing Detection
+// Dấu hiệu: 4688.ParentProcessId trỏ đến process đã chết
+//           hoặc parent process không có thread nào tại thời điểm spawn
+// Kỹ thuật: so sánh parent birth/death time với child birth time
+// ----------------------------------------------------------------
+let ProcessDeaths = SecurityEvent
+| where TimeGenerated >= SEARCH_START
+| where EventID == 4689   // Process exit
+| extend
+    dead_key   = strcat(Computer, "|", ProcessId),
+    death_time = TimeCreated;
+
+let PPIDSpoofingCandidates = ProcessTreeTable
+| join kind=leftouter (
+    ProcessDeaths
+    | project dead_key, death_time
+) on $left.parent_key == $right.dead_key
+| where isnotempty(death_time)
+// Parent đã chết TRƯỚC KHI child được tạo → impossible nếu không spoof
+| where birth_time > death_time
+| project
+    birth_time,
+    Machine       = machine,
+    ChildPid      = pid,
+    ChildName     = proc_name,
+    ChildCmdLine  = cmd_line,
+    ParentPid     = parent_pid,
+    ParentName    = parent_name,
+    ParentDied    = death_time,
+    Severity      = "HIGH",
+    Note          = "PPID Spoofing — parent đã exit trước khi child spawn";
+
+
+// ----------------------------------------------------------------
+// ADDON 5: Log Clearing & Audit Policy Change Detection
+// 1102: Security log bị xóa
+// 4719: Audit policy bị thay đổi (tắt logging)
+// ----------------------------------------------------------------
+let LogTampering = SecurityEvent
+| where TimeGenerated >= SEARCH_START
+| where EventID in (1102, 4719)
+| extend
+    tamper_type = case(
+        EventID == 1102, "Security log CLEARED",
+        EventID == 4719, "Audit policy CHANGED",
+        "Unknown"
+    ),
+    tamper_scope = strcat(Computer, "|", SubjectLogonId)
+| project
+    TimeCreated, Computer, EventID,
+    TamperType   = tamper_type,
+    SubjectUser  = SubjectUserName,
+    LogonScope   = tamper_scope,
+    Severity     = "CRITICAL",
+    Note         = "Log tampering — events trước mốc này có thể bị mất hoặc không đáng tin";
+
+// Dùng timestamp của log tampering để annotate ProcessTreeTable:
+// "Mọi orphan process có birth_time gần sau log clear = có thể do xóa log"
+ProcessTreeTable
+| join kind=leftouter (
+    LogTampering | project Computer, tamper_time=TimeCreated
+) on machine == Computer
+| where is_orphan == true
+| where isnotempty(tamper_time)
+| where abs(datetime_diff('minute', birth_time, tamper_time)) < 30
+| extend orphan_reason_updated = "Orphan gần log clear event — likely due to tampering"
+| project birth_time, machine, pid, proc_name, cmd_line, orphan_reason_updated;
+
+
+// ----------------------------------------------------------------
+// ADDON 6: WMI Execution Detection (silent gap)
+// WMI spawn không đi qua CreateProcess thông thường
+// → 4688 có parent = WmiPrvSE.exe — đây là dấu hiệu
+// Kết hợp với WMI-Activity Event 5861 (subscription firing)
+// ----------------------------------------------------------------
+let WMISpawns = ProcessTreeTable
+| where parent_name has "WmiPrvSE"
+| extend wmi_spawn = true
+| project birth_time, machine, pid, proc_name, cmd_line,
+          user_name, parent_name, wmi_spawn;
+
+// Cross-reference với WMI-Activity operational log
+let WMISubscriptions = SecurityEvent   // thực tế dùng: WmiActivity | EventID == 5861
+| where TimeGenerated >= SEARCH_START
+| where EventID == 5861
+| project wmi_time=TimeCreated, Computer, Consumer=EventData;
+
+WMISpawns
+| join kind=leftouter (WMISubscriptions) on machine == Computer
+| where abs(datetime_diff('second', birth_time, wmi_time)) < 10
+| project birth_time, machine, proc_name, cmd_line, Consumer,
+          Note = "WMI-triggered process — correlate với subscription";
+
+
+// ----------------------------------------------------------------
+// ADDON 7: LOLBins Behavioral Detection
+// Process name hợp lệ nhưng CommandLine bất thường
+// Không thể detect từ process tree structure — phải dùng content
+// ----------------------------------------------------------------
+let LOLBinsSuspicious = ProcessTreeTable
+| where proc_name has_any (
+    "certutil.exe", "mshta.exe", "regsvr32.exe", "rundll32.exe",
+    "wscript.exe", "cscript.exe", "msiexec.exe", "installutil.exe",
+    "powershell.exe", "pwsh.exe", "wmic.exe", "bitsadmin.exe"
+)
+| extend suspicion_reason = case(
+    proc_name has "certutil"     and cmd_line has "-urlcache",  "CertUtil download",
+    proc_name has "mshta"        and cmd_line has "http",       "MSHTA remote script",
+    proc_name has "regsvr32"     and cmd_line has "/s /u /i",   "Squiblydoo",
+    proc_name has "rundll32"     and cmd_line has "javascript:", "Rundll32 JS exec",
+    proc_name has "powershell"   and cmd_line has "-enc",        "PowerShell encoded cmd",
+    proc_name has "powershell"   and cmd_line has "-w hidden",   "PowerShell hidden window",
+    proc_name has "wmic"         and cmd_line has "process call create", "WMIC process spawn",
+    proc_name has "bitsadmin"    and cmd_line has "/transfer",   "BITS download",
+    "Review manually"
+)
+| where suspicion_reason != "Review manually"
+    or (proc_name has_any ("mshta","installutil") and isnotempty(cmd_line))
+| project
+    birth_time, machine, pid, proc_name, cmd_line,
+    user_name, parent_name, suspicion_reason,
+    Severity = "HIGH";

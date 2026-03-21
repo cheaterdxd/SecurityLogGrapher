@@ -1,0 +1,341 @@
+// ============================================================
+// PROCESS TREE CORRELATION v3 — Multi-Machine Safe
+// Fix so với v2:
+//   BUG1: Composite key = ComputerName + PID + birth_time
+//   BUG2: LogonId scope = ComputerName + LogonId
+//   BUG3: Clock skew detection và warning flag
+//   BUG4: UTC normalization check
+//   BUG5: EventRecordId gap detection (log bị mất)
+// ============================================================
+
+
+// ----------------------------------------------------------------
+// THAM SỐ CẤU HÌNH — chỉnh tại đây
+// ----------------------------------------------------------------
+let LOOK_BACK         = 24h;              // cửa sổ thời gian phân tích
+let PID_REUSE_WINDOW  = 30s;              // nếu 2 process cùng PID cách nhau < 30s → reuse
+let REG_TIME_WINDOW   = 30s;             // fallback window cho 4657 khi không có ProcessId
+let CLOCK_SKEW_LIMIT  = 5min;            // chênh lệch timestamp cho phép giữa các máy
+let SEARCH_START      = ago(LOOK_BACK);
+
+
+// ----------------------------------------------------------------
+// BƯỚC 0: Phát hiện clock skew giữa các máy
+// So sánh TimeGenerated (UTC khi Sentinel nhận) với TimeCreated
+// (timestamp do máy nguồn tự ghi). Chênh lệch lớn = clock drift.
+// ----------------------------------------------------------------
+let ClockSkewCheck = SecurityEvent
+| where TimeGenerated >= SEARCH_START
+| where EventID in (4624, 4688)
+| extend
+    agent_receive_time  = TimeGenerated,    // UTC — khi Sentinel nhận được
+    machine_claim_time  = TimeCreated,      // Local claim của máy nguồn
+    skew_seconds        = datetime_diff('second', TimeGenerated, TimeCreated)
+| summarize
+    avg_skew_s   = avg(skew_seconds),
+    max_skew_s   = max(abs(skew_seconds)),
+    event_count  = count()
+    by Computer
+| extend has_clock_issue = (max_skew_s > datetime_diff('second', CLOCK_SKEW_LIMIT, datetime(0)));
+
+// Log ra để xem — nếu has_clock_issue = true thì time window JOIN phải nới rộng
+ClockSkewCheck
+| where has_clock_issue == true
+| project Computer, avg_skew_s, max_skew_s, event_count,
+          Warning = "Clock skew > 5 phút — time-based JOIN có thể sai thứ tự";
+
+
+// ----------------------------------------------------------------
+// BƯỚC 1: Process Lifecycle Table với Composite Key
+//
+// KEY THAY ĐỔI SO VỚI v2:
+//   process_key = ComputerName + "|" + PID  (BUG1 fix)
+//   Không bao giờ JOIN chỉ theo PID đơn thuần
+// ----------------------------------------------------------------
+let ProcessTable = SecurityEvent
+| where TimeGenerated >= SEARCH_START
+| where EventID == 4688
+| extend
+    // Composite key — duy nhất trên toàn bộ fleet
+    process_key  = strcat(Computer, "|", NewProcessId),
+    parent_key   = strcat(Computer, "|", ProcessId),    // parent phải cùng máy
+    pid          = tolong(NewProcessId),
+    parent_pid   = tolong(ProcessId),
+    machine      = Computer,                             // giữ lại để filter cross-machine
+    logon_scope  = strcat(Computer, "|", SubjectLogonId), // BUG2 fix: LogonId scoped to machine
+    logon_id     = SubjectLogonId,
+    user_sid     = SubjectUserSid,
+    user_name    = SubjectUserName,
+    domain       = SubjectDomainName,
+    proc_name    = NewProcessName,
+    cmd_line     = CommandLine,
+    birth_time   = TimeCreated,
+    record_id    = EventRecordId,   // BUG5: track để detect gap
+    spawning_tid = tolong(extract(@'<Execution\s[^>]*ThreadID="(\d+)"', 1, EventData))
+| project birth_time, machine, process_key, parent_key, pid, parent_pid,
+          logon_scope, logon_id, user_sid, user_name, domain,
+          proc_name, cmd_line, spawning_tid, record_id;
+
+
+// ----------------------------------------------------------------
+// BƯỚC 1b: Phát hiện EventRecordId gap (log bị mất — BUG5)
+// Nếu record_id không liên tục → có event bị drop
+// → parent của một số process có thể bị mất → orphan sai
+// ----------------------------------------------------------------
+let RecordIdGaps = ProcessTable
+| summarize
+    record_ids = make_list(record_id),
+    min_id     = min(record_id),
+    max_id     = max(record_id),
+    actual     = count()
+    by machine
+| extend
+    expected = tolong(max_id) - tolong(min_id) + 1,
+    gap_count = (tolong(max_id) - tolong(min_id) + 1) - count_
+| where gap_count > 0
+| project machine, min_id, max_id, actual, expected, gap_count,
+          Warning = "EventRecordId gap phát hiện — có thể mất parent events";
+
+
+// ----------------------------------------------------------------
+// BƯỚC 2: Self-JOIN với Composite Key (BUG1+BUG2 fix)
+// JOIN: child.parent_key == parent.process_key
+//   → đảm bảo parent và child phải cùng một máy
+// ----------------------------------------------------------------
+let ProcessTreeTable = ProcessTable
+| join kind=leftouter (
+    ProcessTable
+    | project
+        parent_process_key = process_key,
+        parent_birth       = birth_time,
+        parent_pid         = pid,
+        parent_name        = proc_name,
+        parent_cmd         = cmd_line,
+        parent_logon_scope = logon_scope,
+        parent_user        = user_name
+) on $left.parent_key == $right.parent_process_key
+// Đảm bảo child sinh sau parent
+| where isempty(parent_birth) or birth_time >= parent_birth
+// Với PID reuse: lấy parent instance gần nhất trước child
+| summarize arg_max(parent_birth, *) by birth_time, process_key, proc_name
+| extend
+    // Flag: orphan vì parent không tìm thấy (bị mất hoặc ngoài time window)
+    is_orphan = isempty(parent_name),
+    // Flag: PID reuse candidate nếu khoảng cách quá nhỏ
+    possible_pid_reuse = (isnotempty(parent_birth)
+        and datetime_diff('second', birth_time, parent_birth) < datetime_diff('second', PID_REUSE_WINDOW, datetime(0)))
+| project birth_time, machine, process_key, pid, proc_name, cmd_line,
+          logon_scope, logon_id, user_name, domain,
+          parent_pid, parent_name, parent_cmd, parent_user,
+          spawning_tid, is_orphan, possible_pid_reuse;
+
+
+// ----------------------------------------------------------------
+// BƯỚC 3: Enrich Event 4663 (File Access)
+// JOIN theo process_key = ComputerName + ProcessId
+// ----------------------------------------------------------------
+let FileAccessEnriched = SecurityEvent
+| where TimeGenerated >= SEARCH_START
+| where EventID == 4663
+| extend
+    fa_process_key = strcat(Computer, "|", ProcessId),  // composite key
+    fa_logon_scope = strcat(Computer, "|", SubjectLogonId),
+    fa_logonid     = SubjectLogonId,
+    fa_user        = SubjectUserName,
+    fa_object      = ObjectName,
+    fa_access      = AccessMask,
+    fa_time        = TimeCreated,
+    fa_machine     = Computer,
+    fa_tid         = tolong(extract(@'<Execution\s[^>]*ThreadID="(\d+)"', 1, EventData))
+| join kind=inner (ProcessTreeTable) on $left.fa_process_key == $right.process_key
+| where fa_time >= birth_time
+| extend
+    is_sequential    = (fa_tid == spawning_tid),
+    logonid_mismatch = (fa_logon_scope != logon_scope)
+| project
+    EventType        = "FileAccess",
+    Machine          = machine,
+    EventTime        = fa_time,
+    TID              = fa_tid,
+    IsSequential     = is_sequential,
+    ProcessKey       = fa_process_key,
+    ProcessName      = proc_name,
+    CommandLine      = cmd_line,
+    User             = user_name,
+    LogonScope       = logon_scope,      // ComputerName|LogonId — scope đúng
+    LogonId          = logon_id,
+    ParentName       = parent_name,
+    Detail           = strcat("File: ", fa_object, "  Access: ", fa_access),
+    LogonId_mismatch = logonid_mismatch, // true → token impersonation
+    IsOrphan         = is_orphan,
+    PossiblePidReuse = possible_pid_reuse;
+
+
+// ----------------------------------------------------------------
+// BƯỚC 4: Enrich Event 4657 (Registry) — 3-level JOIN
+// Tất cả join đều dùng composite key có ComputerName
+// ----------------------------------------------------------------
+let RegistryRaw = SecurityEvent
+| where TimeGenerated >= SEARCH_START
+| where EventID == 4657
+| extend
+    reg_process_key  = strcat(Computer, "|", ProcessId),
+    reg_logon_scope  = strcat(Computer, "|", SubjectLogonId),  // BUG2 fix
+    reg_pid          = tolong(ProcessId),
+    reg_procname     = ProcessName,
+    reg_logonid      = SubjectLogonId,
+    reg_user         = SubjectUserName,
+    reg_key          = ObjectName,
+    reg_val          = OperationType,
+    reg_time         = TimeCreated,
+    reg_machine      = Computer,
+    reg_tid          = tolong(extract(@'<Execution\s[^>]*ThreadID="(\d+)"', 1, EventData));
+
+// Level 1: ProcessId valid + ProcessName match
+let Reg_L1 = RegistryRaw
+| where isnotempty(reg_pid) and reg_pid != 0
+| join kind=inner (ProcessTreeTable) on $left.reg_process_key == $right.process_key
+| where reg_time >= birth_time
+| where isempty(reg_procname) or reg_procname == proc_name
+| extend join_quality = "L1_PID+Name";
+
+// Level 2: ProcessId valid nhưng ProcessName mismatch (đánh dấu cảnh báo)
+let Reg_L2 = RegistryRaw
+| where isnotempty(reg_pid) and reg_pid != 0
+| join kind=inner (ProcessTreeTable) on $left.reg_process_key == $right.process_key
+| where reg_time >= birth_time
+| where isnotempty(reg_procname) and reg_procname != proc_name
+| extend join_quality = "L2_PID_NameMismatch_CheckReuse";
+
+// Level 3: Fallback LogonId — scoped by ComputerName (BUG2 fix)
+let Reg_L3 = RegistryRaw
+| where isempty(reg_pid) or reg_pid == 0
+| join kind=inner (ProcessTreeTable) on $left.reg_logon_scope == $right.logon_scope
+| where reg_time between (birth_time .. (birth_time + REG_TIME_WINDOW))
+| summarize arg_max(birth_time, *) by reg_time, reg_key, reg_machine
+| extend join_quality = "L3_LogonId_Fallback";
+
+let RegistryEnriched =
+    Reg_L1 | union Reg_L2 | union Reg_L3
+| extend
+    is_sequential    = (reg_tid == spawning_tid),
+    logonid_mismatch = (reg_logon_scope != logon_scope)
+| project
+    EventType        = "RegistryMod",
+    Machine          = machine,
+    EventTime        = reg_time,
+    TID              = reg_tid,
+    IsSequential     = is_sequential,
+    JoinQuality      = join_quality,
+    ProcessKey       = reg_process_key,
+    ProcessName      = proc_name,
+    ProcessName_raw  = reg_procname,
+    CommandLine      = cmd_line,
+    User             = user_name,
+    LogonScope       = logon_scope,
+    LogonId          = logon_id,
+    ParentName       = parent_name,
+    Detail           = strcat("RegKey: ", reg_key, "  Op: ", reg_val),
+    LogonId_mismatch = logonid_mismatch,
+    IsOrphan         = is_orphan,
+    PossiblePidReuse = possible_pid_reuse;
+
+
+// ----------------------------------------------------------------
+// BƯỚC 5: UNION + phân luồng theo LogonScope (ComputerName|LogonId)
+//
+// Phân luồng user ĐÚNG cách trong môi trường multi-machine:
+//   - GROUP BY LogonScope (không phải LogonId đơn thuần)
+//   - Lọc well-known SYSTEM sessions
+//   - Join 4624 cũng scope theo ComputerName
+// ----------------------------------------------------------------
+let WellKnownLogonIds = dynamic(["0x3e7","0x3E7","0x3e4","0x3E4","0x3e5","0x3E5"]);
+
+let AllEnriched =
+    FileAccessEnriched | union RegistryEnriched
+| where LogonId !in (WellKnownLogonIds);
+
+let SessionInfo = SecurityEvent
+| where TimeGenerated >= SEARCH_START
+| where EventID == 4624
+| extend logon_scope = strcat(Computer, "|", TargetLogonId)  // scoped key
+| project
+    logon_scope,
+    logon_type_name = case(
+        LogonType == 2,  "Interactive",
+        LogonType == 3,  "Network",
+        LogonType == 5,  "Service",
+        LogonType == 10, "RDP",
+        "Other"),
+    source_ip   = IpAddress,
+    logon_time  = TimeCreated;
+
+AllEnriched
+| join kind=leftouter (SessionInfo) on $left.LogonScope == $right.logon_scope
+| project
+    Machine,
+    EventTime,
+    LogonScope,           // ComputerName|LogonId — unique across fleet
+    LogonType      = logon_type_name,
+    SourceIP       = source_ip,
+    User,
+    TID,
+    IsSequential,
+    JoinQuality,
+    LogonId_mismatch,
+    PossiblePidReuse,
+    IsOrphan,
+    ParentName,
+    ProcessName,
+    CommandLine,
+    EventType,
+    Detail
+| sort by Machine asc, LogonScope asc, EventTime asc;
+
+
+// ----------------------------------------------------------------
+// BƯỚC 6: Orphan analysis — phân loại nguyên nhân
+// ----------------------------------------------------------------
+ProcessTreeTable
+| where is_orphan == true
+| join kind=leftouter (RecordIdGaps) on machine
+| extend orphan_reason = case(
+    isnotempty(Warning), "Log gap — parent event bị mất",
+    birth_time < SEARCH_START + 5min, "Parent tạo trước time window",
+    "Unknown — cần điều tra thêm"
+)
+| project birth_time, machine, pid, proc_name, cmd_line,
+          user_name, parent_pid, orphan_reason
+| sort by machine, birth_time asc;
+
+
+// ----------------------------------------------------------------
+// BƯỚC 7: Thread injection detection (Sysmon Event 8)
+// ComputerName bắt buộc trong join để tránh cross-machine false positive
+// ----------------------------------------------------------------
+SecurityEvent
+| where TimeGenerated >= SEARCH_START
+| where EventID == 8   // Sysmon CreateRemoteThread
+| extend
+    src_key  = strcat(Computer, "|", SourceProcessId),
+    tgt_key  = strcat(Computer, "|", TargetProcessId),
+    src_tid  = tolong(SourceThreadId),
+    tgt_tid  = tolong(NewThreadId),
+    tgt_img  = TargetImage,
+    inj_machine = Computer
+| where SourceProcessId != TargetProcessId
+| join kind=leftouter (
+    ProcessTreeTable | project process_key, src_name=proc_name, src_user=user_name
+) on $left.src_key == $right.process_key
+| join kind=leftouter (
+    ProcessTreeTable | project process_key, tgt_name=proc_name
+) on $left.tgt_key == $right.process_key
+| project
+    TimeCreated,
+    Machine      = inj_machine,
+    SourceName   = src_name,
+    SourceTID    = src_tid,
+    SourceUser   = src_user,
+    TargetName   = tgt_name,
+    InjectedTID  = tgt_tid,
+    Severity     = iff(tgt_img has_any ("lsass","winlogon","csrss"), "CRITICAL", "HIGH");
